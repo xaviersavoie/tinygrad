@@ -311,6 +311,14 @@ class ReduceContext:
   acc_num: int = 0
   ren: Renderer|None = None
 
+def gep_for_fma(inp:UOp, indices:tuple[int, ...]) -> UOp:
+  """GEP that preserves float4 MUL for FMA optimization on CPU.
+  Instead of GEP'ing the MUL result (which becomes scalar MULs assembled into float4),
+  we GEP the MUL operands and create a new float4 MUL (which survives devectorize)."""
+  if inp.op is Ops.MUL:
+    return inp.src[0].gep(indices).alu(Ops.MUL, inp.src[1].gep(indices))
+  return inp.gep(indices)
+
 def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
   # if this has a horizontal reduction component, do that first
   if inp.dtype != out_dtype:
@@ -368,12 +376,12 @@ def reduce_to_acc(ctx:ReduceContext, red:UOp):
         row_start = row * horizontal_amount
         # Accumulate all chunks for this row
         first_chunk_indices = tuple(range(row_start, row_start + vec_width))
-        acc_val = acc_idx.alu(Ops.ADD, inp.gep(first_chunk_indices))
+        acc_val = acc_idx.alu(Ops.ADD, gep_for_fma(inp, first_chunk_indices))
 
         for chunk in range(1, chunks_per_row):
           chunk_start = row_start + chunk * vec_width
           chunk_indices = tuple(range(chunk_start, chunk_start + vec_width))
-          inp_chunk = inp.gep(chunk_indices)
+          inp_chunk = gep_for_fma(inp, chunk_indices)
           acc_val = acc_val.alu(Ops.ADD, inp_chunk)
 
         # Store updated value (inside loop, no END yet)
