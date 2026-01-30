@@ -239,7 +239,11 @@ def no_vectorized_alu(ctx:Renderer|str|None, alu:UOp):
   alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg) for i in range(alu.dtype.vcount))
   return UOp(Ops.VECTORIZE, alu.dtype, alus)
 
-def no_vectorized_buf(buf:UOp):
+def no_vectorized_buf(ctx:Renderer|str|None, buf:UOp):
+  # CPU: preserve small vector REGs (float4) for packed FMA - they fit in SSE/AVX registers
+  device = ctx.device if isinstance(ctx, Renderer) else ctx
+  base_count = buf.ptrdtype.base.count if hasattr(buf.ptrdtype.base, 'count') else 1
+  if device == "CPU" and buf.op is Ops.DEFINE_REG and base_count <= 4 and buf.ptrdtype.base.scalar() == dtypes.float: return None
   return buf.replace(dtype=buf.ptrdtype.base.scalar().ptr(buf.ptrdtype.size*buf.ptrdtype.count, buf.ptrdtype.addrspace)).cast(buf.dtype)
 
 def no_vectorized_index(buf:UOp, cast:UOp, idx:UOp):
