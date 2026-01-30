@@ -157,12 +157,26 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
           k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
       else:
-        # CPU matvec: try larger UNROLL for more ILP in the reduce loop
+        # CPU matmul: try larger UNROLL for more ILP in the reduce loop
+        # For fused kernels with multiple reduces, unroll ALL reduce dims to enable vectorization
         unroll_splits = [16, 8, 4] if cpu_matvec else [4]
-        for splits in unroll_splits:
-          if k.full_shape[axis:=k.unrollable_dims[-1]]%splits == 0:
-            k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, splits))
-            break
+        if cpu_matmul:
+          # Unroll all unrollable dims for CPU matmul (enables vectorized loads for all reduces)
+          # We unroll from highest index to lowest to avoid index shifting issues
+          for unroll_idx in range(len(k.unrollable_dims) - 1, -1, -1):
+            if unroll_idx >= len(k.unrollable_dims): continue  # dim may have been removed
+            for splits in unroll_splits:
+              if k.full_shape[k.unrollable_dims[unroll_idx]] % splits == 0:
+                try:
+                  k.apply_opt(Opt(OptOps.UNROLL, unroll_idx, splits))
+                except KernelOptError:
+                  pass
+                break
+        else:
+          for splits in unroll_splits:
+            if k.full_shape[axis:=k.unrollable_dims[-1]]%splits == 0:
+              k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, splits))
+              break
   except KernelOptError: pass
 
   # if nothing at all is upcasted and it's easy to, do an upcast
