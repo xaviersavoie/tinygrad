@@ -32,6 +32,21 @@ jobs:
       run: CPU=1 CPU_LLVM=1 python3 test/speed/external_test_speed_v_torch.py
     - name: Speed Test (BEAM=2)
       run: BEAM=2 CPU=1 CPU_LLVM=1 python3 test/speed/external_test_speed_v_torch.py
+
+  llama_cpu:
+    name: Llama CPU Speed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+    - name: Setup Environment
+      uses: ./.github/actions/setup-tinygrad
+      with:
+        key: llama-cpu-speed
+        deps: testing_minimal
+        llvm: 'true'
+        pydeps: 'transformers'
     - name: Llama 1B CPU Speed Test
       run: CPU=1 CPU_LLVM=1 python3 test/speed/external_test_llama_cpu.py
 
