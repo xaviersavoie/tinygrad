@@ -115,9 +115,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   is_matvec = has_reduce and sum(s > 1 for s in k.output_shape) == 1
   is_matmul = has_reduce and sum(s != 1 for s in k.output_shape) >= 2 
 
+  # device-agnostic, matvec generally has a small output
+  upcast_threshold = 16 if is_matvec else 1024
 
   upcasted_axis: set[int] = set()
-  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
+  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= upcast_threshold) and (k.upcast_size() < 32):
     xb_choices = []
     # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
     for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
