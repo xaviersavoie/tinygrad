@@ -10,6 +10,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["CPU_COUNT"] = "1"  # tinygrad: limit to 1 core
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # disable CUDA for torch (avoid cudagraph warnings)
 
 import unittest
 import time
