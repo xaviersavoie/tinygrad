@@ -232,18 +232,18 @@ def no_vectorized_wmma(wmma:UOp):
 def no_vectorized_alu(ctx:Renderer|str|None, alu:UOp):
   if alu.dtype.vcount == 1: return None
   if alu.op is Ops.WHERE and alu.src[2].arg is Invalid: return None  # image load/store has cond.where(idx.vec(2), Invalid) as the index
-  # CPU: preserve small vector arithmetic (float4 ADD/MUL) for packed FMA - they fit in SSE/AVX registers
-  # Don't preserve WHERE/comparisons which have bool4 vs float4 mismatch issues in C
+  # CPU: preserve vector arithmetic (float8 ADD/MUL) for packed FMA - they fit in AVX/AVX2 registers
+  # Don't preserve WHERE/comparisons which have bool8 vs float8 mismatch issues in C
   device = ctx.device if isinstance(ctx, Renderer) else ctx
-  if device == "CPU" and alu.dtype.vcount <= 4 and alu.dtype.scalar() == dtypes.float and alu.op in (Ops.ADD, Ops.MUL): return None
+  if device == "CPU" and alu.dtype.vcount <= 8 and alu.dtype.scalar() == dtypes.float and alu.op in (Ops.ADD, Ops.MUL): return None
   alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg) for i in range(alu.dtype.vcount))
   return UOp(Ops.VECTORIZE, alu.dtype, alus)
 
 def no_vectorized_buf(ctx:Renderer|str|None, buf:UOp):
-  # CPU: preserve small vector REGs (float4) for packed FMA - they fit in SSE/AVX registers
+  # CPU: preserve vector REGs (float8) for packed FMA - they fit in AVX/AVX2 registers
   device = ctx.device if isinstance(ctx, Renderer) else ctx
   base_count = buf.ptrdtype.base.count if hasattr(buf.ptrdtype.base, 'count') else 1
-  if device == "CPU" and buf.op is Ops.DEFINE_REG and base_count <= 4 and buf.ptrdtype.base.scalar() == dtypes.float: return None
+  if device == "CPU" and buf.op is Ops.DEFINE_REG and base_count <= 8 and buf.ptrdtype.base.scalar() == dtypes.float: return None
   return buf.replace(dtype=buf.ptrdtype.base.scalar().ptr(buf.ptrdtype.size*buf.ptrdtype.count, buf.ptrdtype.addrspace)).cast(buf.dtype)
 
 def no_vectorized_index(buf:UOp, cast:UOp, idx:UOp):
@@ -338,8 +338,8 @@ def reduce_to_acc(ctx:ReduceContext, red:UOp):
                  red.dtype.scalar() == dtypes.float)
 
   if use_vec_fma:
-    # Choose vector width for packed FMA (4 for SSE/AVX float4)
-    vec_width = min(4, horizontal_amount)
+    # Choose vector width for packed FMA (8 for AVX/AVX2 float8)
+    vec_width = min(8, horizontal_amount)
     if horizontal_amount % vec_width != 0:
       vec_width = 1  # fall back to scalar if not divisible
 
