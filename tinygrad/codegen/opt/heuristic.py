@@ -109,6 +109,13 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # potentially do more upcasts of non reduce axes based on a heuristic
   is_dsp = k.ren is not None and k.ren.device == "DSP"
   is_cpu = k.ren is not None and k.ren.device == "CPU"
+  
+  # simple detection for matvec/matmul
+  has_reduce = k.reduceop is not None
+  is_matvec = has_reduce and sum(s > 1 for s in k.output_shape) == 1
+  is_matmul = has_reduce and sum(s != 1 for s in k.output_shape) >= 2 
+
+
   upcasted_axis: set[int] = set()
   while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
