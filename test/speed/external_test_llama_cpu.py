@@ -20,7 +20,6 @@ torch.set_num_interop_threads(1)  # inter-op parallelism
 
 # explicitly not using cudagraphs
 torch._inductor.config.triton.cudagraphs = False
-torch._inductor.config.cudagraph_support_input_mutation = False
 
 from transformers import LlamaConfig, LlamaForCausalLM
 from tinygrad import Tensor, Device
