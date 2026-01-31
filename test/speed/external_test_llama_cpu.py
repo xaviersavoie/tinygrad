@@ -47,6 +47,13 @@ class TestLlamaCPU(unittest.TestCase):
     )
     torch_model = LlamaForCausalLM(config).eval()
 
+    torch_model = torch.compile(
+        torch_model,
+        backend="inductor",
+        mode="max-autotune"
+    )
+
+
     # --- Tinygrad model ---
     tiny_model = Transformer(DIM, HIDDEN, HEADS, LAYERS, norm_eps=1e-5, vocab_size=VOCAB_SIZE,
                              n_kv_heads=N_KV_HEADS, rope_theta=500000, max_context=MAX_CONTEXT, jit=True)
