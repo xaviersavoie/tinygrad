@@ -142,6 +142,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         xb_choices.append((num_strides, sum_strides, axis, upcast_amount))
     if xb_choices:
       xb_choices = sorted(xb_choices)
+      if is_cpu:
+          # prefer larger tiles for cache efficiency on cpu
+          candidates = [x for x in xb_choices if x[:3] == xb_choices[0][:3]]
+          xb_choices[0] = max(candidates, key=lambda x: x[3])
       if DEBUG >= 4: print(f"more upcast axis : {xb_choices}")
       k.apply_opt(Opt(OptOps.UPCAST, xb_choices[0][2], xb_choices[0][3]))
       upcasted_axis.add(xb_choices[0][2])
