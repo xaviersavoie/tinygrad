@@ -227,13 +227,17 @@ def no_vectorized_wmma(wmma:UOp):
   wmma_ex = flatten([[e.gep(i) for i in range(out_sz)] for e in wmmas])
   return UOp(Ops.VECTORIZE, wmma.dtype, tuple(wmma_ex))
 
-def no_vectorized_alu(alu:UOp):
+def no_vectorized_alu(ctx:Renderer|str|None, alu:UOp):
   if alu.dtype.vcount == 1: return None
   if alu.op is Ops.WHERE and alu.src[2].arg is Invalid: return None  # image load/store has cond.where(idx.vec(2), Invalid) as the index
+  device = ctx.device if isinstance(ctx, Renderer) else ctx
+  if device == "CPU" and alu.dtype.vcount <= 8 and alu.dtype.scalar() == dtypes.float and alu.op in (Ops.ADD, Ops.MUL): return None
   alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg) for i in range(alu.dtype.vcount))
   return UOp(Ops.VECTORIZE, alu.dtype, alus)
 
-def no_vectorized_buf(buf:UOp):
+def no_vectorized_buf(ctx:Renderer|str|None, buf:UOp):
+  device = ctx.device if isinstance(ctx, Renderer) else ctx
+  if device == "CPU" and buf.op is Ops.DEFINE_REG and buf.ptrdtype.base.vcount <= 8 and buf.ptrdtype.base.scalar() == dtypes.float: return None
   return buf.replace(dtype=buf.ptrdtype.base.scalar().ptr(buf.ptrdtype.size*buf.ptrdtype.count, buf.ptrdtype.addrspace)).cast(buf.dtype)
 
 def no_vectorized_index(buf:UOp, cast:UOp, idx:UOp):
