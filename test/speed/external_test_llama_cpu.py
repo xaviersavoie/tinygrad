@@ -25,7 +25,8 @@ torch._inductor.config.triton.cudagraphs = False
 from transformers import LlamaConfig, LlamaForCausalLM
 from tinygrad import Tensor, Device
 from tinygrad.helpers import getenv, colorize_float
-from extra.models.llama import Transformer
+from tinygrad.apps.llm import Transformer
+from tinygrad.uop.ops import UOp
 
 # Verify single-threaded execution
 assert torch.get_num_threads() == 1, f"torch using {torch.get_num_threads()} threads, expected 1"
@@ -60,8 +61,11 @@ class TestLlamaCPU(unittest.TestCase):
 
 
     # --- Tinygrad model ---
-    tiny_model = Transformer(DIM, HIDDEN, HEADS, LAYERS, norm_eps=1e-5, vocab_size=VOCAB_SIZE,
-                             n_kv_heads=N_KV_HEADS, rope_theta=500000, max_context=MAX_CONTEXT, jit=True)
+    HEAD_DIM = DIM // HEADS
+    tiny_model = Transformer(num_blocks=LAYERS, dim=DIM, hidden_dim=HIDDEN, n_heads=HEADS,
+                             n_kv_heads=N_KV_HEADS, norm_eps=1e-5, vocab_size=VOCAB_SIZE,
+                             head_dim=HEAD_DIM, rope_theta=500000, max_context=MAX_CONTEXT)
+    v_start_pos = UOp.variable("start_pos", 1, MAX_CONTEXT-1)
 
     # Warmup: prefill + decode for HuggingFace
     with torch.no_grad():
@@ -73,10 +77,10 @@ class TestLlamaCPU(unittest.TestCase):
         past_kv = outputs.past_key_values
 
     # Warmup: prefill + decode for tinygrad
-    tiny_model(Tensor([[1, 2, 3, 4, 5]]), start_pos=0, temperature=0.0)
+    tiny_model(Tensor([[1, 2, 3, 4, 5]]), start_pos=0)
     Device[Device.DEFAULT].synchronize()
     for i in range(3):
-      tiny_model(Tensor([[1]]), start_pos=5+i, temperature=0.0)
+      tiny_model(Tensor([[1]]), start_pos=v_start_pos.bind(5+i))
       Device[Device.DEFAULT].synchronize()
 
     # Benchmark decode
@@ -95,11 +99,15 @@ class TestLlamaCPU(unittest.TestCase):
         past_kv = outputs.past_key_values
         torch_times.append(time.perf_counter() - st)
 
+    # Reset KV cache for tinygrad benchmark (same prefill length as torch)
+    tiny_model(Tensor([[1, 2, 3, 4, 5, 6, 7, 8]]), start_pos=0)
+    Device[Device.DEFAULT].synchronize()
+
     tiny_times = []
     for i in range(N):
       Device[Device.DEFAULT].synchronize()
       st = time.perf_counter()
-      tiny_model(Tensor([[1]]), start_pos=8+i, temperature=0.0)
+      tiny_model(Tensor([[1]]), start_pos=v_start_pos.bind(8+i))
       Device[Device.DEFAULT].synchronize()
       tiny_times.append(time.perf_counter() - st)
 
