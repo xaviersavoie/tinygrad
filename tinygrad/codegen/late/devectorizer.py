@@ -299,6 +299,7 @@ pm_render = PatternMatcher([
 @dataclass
 class ReduceContext:
   acc_num: int = 0
+  ren: Renderer|None = None
 
 def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
   # if this has a horizontal reduction component, do that first
@@ -310,22 +311,29 @@ def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
 
 def reduce_to_acc(ctx:ReduceContext, red:UOp):
   inp, reduce_range = red.src[0], red.src[1:]
-  lst = horizontal_reduce(inp, red.dtype)
-  assert all(x.dtype == red.dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {red.dtype}"
+  # defer reduction for after loop on cpu
+  defer_hreduce = ctx.ren is not None and ctx.ren.device == "CPU" and inp.dtype != red.dtype and len(reduce_range) > 0
+  acc_dtype = inp.dtype if defer_hreduce else red.dtype
+  lst = [inp] if defer_hreduce else horizontal_reduce(inp, red.dtype)
+  assert all(x.dtype == acc_dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {acc_dtype}"
   # if we have a range
   if len(reduce_range) != 0:
     topo = inp.toposort()
     ended_ranges = flatten([x.ended_ranges for x in topo if x.op is Ops.END])
     input_ranges = tuple([x for x in topo if x.op is Ops.RANGE and x not in reduce_range and x not in ended_ranges])
-    identity = red.const(red.dtype, identity_element(red.arg, red.dtype.scalar()))
-    acc = UOp(Ops.DEFINE_REG, red.dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
+    identity = red.const(acc_dtype, identity_element(red.arg, red.dtype.scalar()))
+    acc = UOp(Ops.DEFINE_REG, acc_dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
     acc_init = acc.after(*input_ranges).index(UOp.const(dtypes.int, 0)).store(identity) if len(input_ranges) else \
                acc.index(UOp.const(dtypes.int, 0)).store(identity)
     lst = [acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0))] + lst  # put acc as the first element
     ctx.acc_num += 1
   ret = functools.reduce(lambda x,y: x.alu(red.arg, y), lst)
   if len(reduce_range) == 0: return ret
-  return acc.after(acc.index(UOp.const(dtypes.int, 0)).store(ret).end(*reduce_range)).index(UOp.const(dtypes.int, 0))
+  result = acc.after(acc.index(UOp.const(dtypes.int, 0)).store(ret).end(*reduce_range)).index(UOp.const(dtypes.int, 0))
+  if defer_hreduce:
+    hlst = horizontal_reduce(result, red.dtype) # deferred, better code on cpu
+    return functools.reduce(lambda x,y: x.alu(red.arg, y), hlst)
+  return result
 
 pm_reduce = PatternMatcher([
   # REDUCE -> DEFINE_ACC+ASSIGN
