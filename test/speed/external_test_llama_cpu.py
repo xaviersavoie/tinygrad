@@ -10,17 +10,13 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["CPU_COUNT"] = "1"  # tinygrad: limit to 1 core
-os.environ["CUDA_VISIBLE_DEVICES"] = ""  # disable CUDA for torch (avoid cudagraph warnings)
-os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0" 
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # disable CUDA for torch
 
 import unittest
 import time
 import torch
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)  # inter-op parallelism
-
-# explicitly not using cudagraphs
-torch._inductor.config.triton.cudagraphs = False
 
 from transformers import LlamaConfig, LlamaForCausalLM
 from tinygrad import Tensor, Device
@@ -53,11 +49,7 @@ class TestLlamaCPU(unittest.TestCase):
     )
     torch_model = LlamaForCausalLM(config).eval()
 
-    torch_model = torch.compile(
-        torch_model,
-        backend="inductor",
-        mode="max-autotune"
-    )
+    torch_model = torch.compile(torch_model, backend="inductor", mode="max-autotune-no-cudagraphs")
 
 
     # --- Tinygrad model ---
