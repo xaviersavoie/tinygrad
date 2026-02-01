@@ -161,10 +161,23 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
           k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
       else:
-        for splits in [4]:
-          if k.full_shape[axis:=k.unrollable_dims[-1]]%splits == 0:
-            k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, splits))
-            break
+        unroll_splits = [16, 8, 4] if is_cpu and is_matvec else [4]
+        if is_cpu:
+          # unroll ALL reduce dims for CPU (enables vectorized loads for fused kernels with multiple reduces)
+          for unroll_idx in range(len(k.unrollable_dims) - 1, -1, -1):
+            if unroll_idx >= len(k.unrollable_dims): continue  # dim may have been removed
+            for splits in unroll_splits:
+              if k.full_shape[k.unrollable_dims[unroll_idx]] % splits == 0:
+                try:
+                  k.apply_opt(Opt(OptOps.UNROLL, unroll_idx, splits))
+                except KernelOptError:
+                  pass
+                break
+        else:
+          for splits in unroll_splits:
+            if k.full_shape[axis:=k.unrollable_dims[-1]]%splits == 0:
+              k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, splits))
+              break
   except KernelOptError: pass
 
   # if nothing at all is upcasted and it's easy to, do an upcast
