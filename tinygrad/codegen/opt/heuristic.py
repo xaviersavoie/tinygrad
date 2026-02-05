@@ -60,25 +60,29 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         elif axis in k.unrollable_dims:
           k.apply_opt(Opt(OptOps.UNROLL, k.unrollable_dims.index(axis), 4))
 
-  # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
-  MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
-  if k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
-    k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and k.ren.has_shared and \
+  # detect matvec: reduce(ADD, MUL(load, load)) with stride-1 reduce range
+  is_matvec = False
+  if k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and \
     (mulop:=k.reduceop.src[0]).op is Ops.MUL and mulop.src[0].op is Ops.INDEX and mulop.src[1].op is Ops.INDEX:
     idx0, idx1 = mulop.src[0].src[1].get_idx(), mulop.src[1].src[1].get_idx()
     if k.ranges_of(AxisType.REDUCE):
       first_reduce_rng = k.ranges_of(AxisType.REDUCE)[0]
-      if any(u is first_reduce_rng for u in idx0.split_uop(Ops.ADD)) and all(r in idx1.ranges for r in idx0.ranges):
-        for global_idx in k.axes_of(AxisType.GLOBAL):
-          if first_reduce_rng.src[0].divides(MV_THREADS_PER_ROW) is not None and k.full_shape[global_idx]%(MV_BLOCKSIZE*MV_ROWS_PER_THREAD) == 0:
-            if DEBUG >= 3:
-              print(f"MATVEC: {k.full_shape=} {first_reduce_rng.render()} {MV_BLOCKSIZE=} {MV_THREADS_PER_ROW=} {MV_ROWS_PER_THREAD=}")
-            try:
-              if MV_THREADS_PER_ROW > 1: k.apply_opt(Opt(OptOps.GROUP, 0, MV_THREADS_PER_ROW))
-            except KernelOptError: pass
-            if MV_BLOCKSIZE > 1: k.apply_opt(Opt(OptOps.LOCAL, global_idx, MV_BLOCKSIZE))
-            if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.UPCAST, global_idx, MV_ROWS_PER_THREAD))
-            return k
+      is_matvec = any(u is first_reduce_rng for u in idx0.split_uop(Ops.ADD)) and all(r in idx1.ranges for r in idx0.ranges)
+
+  # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
+  MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
+  if is_matvec and k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) \
+    and k.ren.has_shared:
+    for global_idx in k.axes_of(AxisType.GLOBAL):
+      if first_reduce_rng.src[0].divides(MV_THREADS_PER_ROW) is not None and k.full_shape[global_idx]%(MV_BLOCKSIZE*MV_ROWS_PER_THREAD) == 0:
+        if DEBUG >= 3:
+          print(f"MATVEC: {k.full_shape=} {first_reduce_rng.render()} {MV_BLOCKSIZE=} {MV_THREADS_PER_ROW=} {MV_ROWS_PER_THREAD=}")
+        try:
+          if MV_THREADS_PER_ROW > 1: k.apply_opt(Opt(OptOps.GROUP, 0, MV_THREADS_PER_ROW))
+        except KernelOptError: pass
+        if MV_BLOCKSIZE > 1: k.apply_opt(Opt(OptOps.LOCAL, global_idx, MV_BLOCKSIZE))
+        if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.UPCAST, global_idx, MV_ROWS_PER_THREAD))
+        return k
 
   # are we grouping? (requires local shape support)
   if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if NOLOCALS else 2048), False):
@@ -111,7 +115,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
     # consider all upcastable axes with 3 or 4 upcast (128 on DSP, up to 32 on CPU reduce)
-    upcast_amounts = ([128] if not len(upcasted_axis) else []) if is_dsp else ([32,16,8,4,3] if is_cpu and k.reduceop is not None else [3,4])
+    upcast_amounts = ([128] if not len(upcasted_axis) else []) if is_dsp else ([32,16,8,4,3] if is_cpu and is_matvec else [3,4])
     for axis, upcast_amount in itertools.product(k.upcastable_dims, upcast_amounts):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
@@ -130,7 +134,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     if xb_choices:
       xb_choices = sorted(xb_choices)
       if DEBUG >= 4: print(f"more upcast axis : {xb_choices}")
-      pick = xb_choices[-1] if (is_cpu and k.reduceop is not None) else xb_choices[0]
+      pick = xb_choices[-1] if (is_cpu and is_matvec) else xb_choices[0]
       k.apply_opt(Opt(OptOps.UPCAST, pick[2], pick[3]))
       upcasted_axis.add(pick[2])
     else: break
@@ -138,7 +142,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # if last reduce dim is small(ish), loop unroll the reduce (skip for CPU reduce: compiler auto-vectorizes the upcast accumulators)
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
-    if not (is_cpu and k.reduceop is not None) and k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
+    if not (is_cpu and is_matvec) and k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
         # if it's small, upcast a second reduce dimension too
