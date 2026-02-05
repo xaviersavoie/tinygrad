@@ -106,11 +106,13 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # potentially do more upcasts of non reduce axes based on a heuristic
   is_dsp = k.ren is not None and k.ren.device == "DSP"
+  is_cpu = k.ren is not None and k.ren.device == "CPU"
   upcasted_axis: set[int] = set()
   while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
-    # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
-    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
+    # consider all upcastable axes with 3 or 4 upcast (128 on DSP, up to 32 on CPU reduce)
+    upcast_amounts = ([128] if not len(upcasted_axis) else []) if is_dsp else ([32,16,8,4,3] if is_cpu and k.reduceop is not None else [3,4])
+    for axis, upcast_amount in itertools.product(k.upcastable_dims, upcast_amounts):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
       rng = k.rngs[axis]
@@ -128,14 +130,15 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     if xb_choices:
       xb_choices = sorted(xb_choices)
       if DEBUG >= 4: print(f"more upcast axis : {xb_choices}")
-      k.apply_opt(Opt(OptOps.UPCAST, xb_choices[0][2], xb_choices[0][3]))
-      upcasted_axis.add(xb_choices[0][2])
+      pick = xb_choices[-1] if (is_cpu and k.reduceop is not None) else xb_choices[0]
+      k.apply_opt(Opt(OptOps.UPCAST, pick[2], pick[3]))
+      upcasted_axis.add(pick[2])
     else: break
 
-  # if last reduce dim is small(ish), loop unroll the reduce
+  # if last reduce dim is small(ish), loop unroll the reduce (skip for CPU reduce: compiler auto-vectorizes the upcast accumulators)
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
-    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
+    if not (is_cpu and k.reduceop is not None) and k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
         # if it's small, upcast a second reduce dimension too
