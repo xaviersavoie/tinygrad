@@ -202,7 +202,16 @@ class CPULLVMRenderer(LLVMRenderer):
   has_threads = bool(getenv("THREADS", 1))
   global_max = (CPU_COUNT.value, 0, 0)
   abi = 'win64cc' if sys.platform == 'win32' else None
-  string_rewrite = base_rewrite + PatternMatcher([(UPat(Ops.WMMA, name="wmma"), render_wmma_amx)])
+  code_for_op = {**LLVMRenderer.code_for_op, Ops.MULACC: lambda: None}
+  string_rewrite = base_rewrite + PatternMatcher([
+    (UPat(Ops.MULACC, dtypes.floats, name="x"), lambda ctx,x:
+     f"  {ctx[x]} = call {ldt(x.dtype)} @llvm.fma.{ldt(x.dtype)}({ldt(x.src[0].dtype)} {ctx[x.src[0]]}, "
+     f"{ldt(x.src[1].dtype)} {ctx[x.src[1]]}, {ldt(x.src[2].dtype)} {ctx[x.src[2]]})"),
+    (UPat(Ops.MULACC, name="x"), lambda ctx,x:
+     f"  {ctx[x]}_mul = {lop[x.src[0].dtype.scalar()][Ops.MUL]} {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ctx[x.src[1]]}\n"
+     f"  {ctx[x]} = {lop[x.src[0].dtype.scalar()][Ops.ADD]} {ldt(x.src[0].dtype)} {ctx[x]}_mul, {ctx[x.src[2]]}"),
+    (UPat(Ops.WMMA, name="wmma"), render_wmma_amx),
+  ])
   def render(self, uops: list[UOp]) -> str: return "\n".join((k:=self._render_kernel(uops))[0] + (k[1], self._render_footer(uops)))
   def _render_footer(self, uops: list[UOp]) -> str: return 'attributes #0 = { alwaysinline nounwind "no-builtins" "no-trapping-math"="true" }'
 
