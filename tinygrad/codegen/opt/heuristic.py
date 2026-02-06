@@ -93,6 +93,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # **** below this line need to be optional and benchmarked ****
 
+  
+
   # if there are small dims with lots of valid masks, upcast them (they might be from Tensor.stack)
   to_upcast: list[int] = []
   # upcast leading axes first (hack-ish for winograd; we actually want to upcast masked axes with low stride first)
@@ -106,11 +108,24 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # potentially do more upcasts of non reduce axes based on a heuristic
   is_dsp = k.ren is not None and k.ren.device == "DSP"
+  is_cpu = k.ren is not None and k.ren.device == "CPU"
+  
+  # simple detection for matvec/matmul
+  has_reduce = k.reduceop is not None
+  is_matvec = has_reduce and sum(s > 1 for s in k.output_shape) == 1
+  is_matmul = has_reduce and sum(s != 1 for s in k.output_shape) >= 2 
+
+  # device-agnostic, matvec generally has a small output
+  upcast_threshold = 16 if is_matvec else 1024
+
+  upcast_limit = 8 if is_matvec and is_cpu else (64 if is_cpu else 32) # limit stays at 32 if not on cpu
+  default_upcast_amounts = [8, 4] if is_cpu else [3, 4] # sane defaults for cpu and gpu
+
   upcasted_axis: set[int] = set()
-  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
+  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= upcast_threshold) and (k.upcast_size() < upcast_limit):
     xb_choices = []
-    # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
-    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
+    # consider all upcastable axes with default upcast amounts (128 on the DSP)
+    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else default_upcast_amounts):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
       rng = k.rngs[axis]
@@ -127,6 +142,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         xb_choices.append((num_strides, sum_strides, axis, upcast_amount))
     if xb_choices:
       xb_choices = sorted(xb_choices)
+      if is_cpu:
+        # prefer larger tiles for cache efficiency on cpu
+        candidates = [x for x in xb_choices if x[:3] == xb_choices[0][:3]]
+        xb_choices[0] = max(candidates, key=lambda x: x[3])
       if DEBUG >= 4: print(f"more upcast axis : {xb_choices}")
       k.apply_opt(Opt(OptOps.UPCAST, xb_choices[0][2], xb_choices[0][3]))
       upcasted_axis.add(xb_choices[0][2])
@@ -135,7 +154,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # if last reduce dim is small(ish), loop unroll the reduce
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
-    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
+    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < upcast_limit):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
         # if it's small, upcast a second reduce dimension too
