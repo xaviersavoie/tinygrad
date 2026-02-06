@@ -199,6 +199,7 @@ class LLVMRenderer(Renderer):
 class CPULLVMRenderer(LLVMRenderer):
   device = "CPU"
   has_local = False
+  supports_float4 = False
   has_threads = bool(getenv("THREADS", 1))
   global_max = (CPU_COUNT.value, 0, 0)
   abi = 'win64cc' if sys.platform == 'win32' else None

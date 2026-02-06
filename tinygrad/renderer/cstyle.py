@@ -224,6 +224,7 @@ class ClangRenderer(CStyleLanguage):
   float4_style = ('{', '}')
   gep_arr_threshold = 0
   has_local = False
+  supports_float4 = False
   has_threads = bool(getenv("THREADS", 1))
   global_max = (CPU_COUNT.value, 0, 0)
   infinity = "__builtin_inff()"
