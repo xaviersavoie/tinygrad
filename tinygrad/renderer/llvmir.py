@@ -16,6 +16,7 @@ def ldt(dt:DType):
           dtypes.float16: "half", dtypes.bfloat16: "bfloat", dtypes.float32: "float", dtypes.float64: "double"}[dt]
 
 def lconst(x, dtype:DType):
+  if dtype.vcount > 1: return f"<{', '.join(f'{ldt(dtype.scalar())} {lconst(x, dtype.scalar())}' for _ in range(dtype.vcount))}>"
   if dtype in dtypes.floats:
     if dtype in dtypes.fp8s: return float_to_fp8(x, dtype)
     if math.isinf(x) or math.isnan(x): return "0x%02X%02X%02X%02X%02X%02X%02X%02X" % tuple(struct.pack("d",x)[::-1])
