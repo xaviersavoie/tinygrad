@@ -135,15 +135,17 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     if xb_choices:
       xb_choices = sorted(xb_choices)
       if DEBUG >= 4: print(f"more upcast axis : {xb_choices}")
-      pick = xb_choices[-1] if (is_cpu and is_mul_reduce) else xb_choices[0]
+      cpu_big_upcast = is_cpu and is_mul_reduce
+      pick = xb_choices[-1] if cpu_big_upcast else xb_choices[0]
       k.apply_opt(Opt(OptOps.UPCAST, pick[2], pick[3]))
       upcasted_axis.add(pick[2])
     else: break
 
-  # if last reduce dim is small(ish), loop unroll the reduce (skip for CPU reduce: compiler auto-vectorizes the upcast accumulators)
+  # if last reduce dim is small(ish), loop unroll the reduce (skip if CPU already has large upcast: compiler auto-vectorizes the accumulators)
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
-    if not (is_cpu and is_mul_reduce) and k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
+    if not (is_cpu and is_mul_reduce and k.upcast_size() >= 16) \
+      and k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
         # if it's small, upcast a second reduce dimension too
