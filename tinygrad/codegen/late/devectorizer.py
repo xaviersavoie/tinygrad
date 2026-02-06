@@ -227,21 +227,32 @@ def no_vectorized_wmma(wmma:UOp):
   wmma_ex = flatten([[e.gep(i) for i in range(out_sz)] for e in wmmas])
   return UOp(Ops.VECTORIZE, wmma.dtype, tuple(wmma_ex))
 
-def no_vectorized_alu(alu:UOp):
+def no_vectorized_alu(ctx, alu:UOp):
   if alu.dtype.vcount == 1: return None
   if alu.op is Ops.WHERE and alu.src[2].arg is Invalid: return None  # image load/store has cond.where(idx.vec(2), Invalid) as the index
+  # on CPU, preserve wide float vector ADD/MUL from deferred reductions for better LLVM vectorization
+  if isinstance(ctx, Renderer) and ctx.device == "CPU" and alu.dtype.scalar() == dtypes.float and alu.op in (Ops.ADD, Ops.MUL) \
+    and alu.dtype.count > 8: return None
   alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg) for i in range(alu.dtype.vcount))
   return UOp(Ops.VECTORIZE, alu.dtype, alus)
 
-def no_vectorized_buf(buf:UOp):
+def no_vectorized_buf(ctx, buf:UOp):
+  # on CPU, preserve deferred register buffers for vectorized accumulation
+  if buf.op is Ops.DEFINE_REG and buf.tag == "deferred": return None
   return buf.replace(dtype=buf.ptrdtype.base.scalar().ptr(buf.ptrdtype.size*buf.ptrdtype.count, buf.ptrdtype.addrspace)).cast(buf.dtype)
 
-def no_vectorized_index(buf:UOp, cast:UOp, idx:UOp):
+def _is_deferred_reg(buf:UOp) -> bool:
+  reg = buf.src[0] if buf.op is Ops.AFTER else buf
+  return reg.op is Ops.DEFINE_REG and reg.tag == "deferred"
+
+def no_vectorized_index(ctx, buf:UOp, cast:UOp, idx:UOp):
+  if isinstance(ctx, Renderer) and _is_deferred_reg(buf): return None
   cnt = cast.dtype.count
   assert idx.dtype.count == 1, f"idx dtype must be 1 {idx.dtype}"
   return buf.broadcast(cnt).index(idx.broadcast(cnt)*cnt+UOp.const(dtypes.index.vec(cnt), tuple(range(cnt))), ptr=True)
 
-def no_vectorized_index_broadcast(buf:UOp, cast:UOp, bcast:UOp, idx:UOp):
+def no_vectorized_index_broadcast(ctx, buf:UOp, cast:UOp, bcast:UOp, idx:UOp):
+  if isinstance(ctx, Renderer) and _is_deferred_reg(buf): return None
   cnt = cast.dtype.count
   vcnt = cast.dtype.vcount
   precnt = bcast.dtype.vcount
@@ -301,6 +312,7 @@ class ReduceContext:
   acc_num: int = 0
   # track ENDs by range for merging parallel reduces
   range_to_ends: dict[tuple[UOp, ...], list[UOp]] = field(default_factory=dict)
+  ren: Renderer|None = None
 
 def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
   # if this has a horizontal reduction component, do that first
@@ -310,17 +322,24 @@ def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
     return [inp.gep(tuple(range(i, inp.dtype.count, horizontal_amount))) for i in range(0, horizontal_amount)]
   return [inp]
 
+def _has_type_promotion(inp:UOp) -> bool:
+  return inp.op is Ops.CAST and inp.dtype.scalar() != inp.src[0].dtype.scalar()
+
 def reduce_to_acc(ctx:ReduceContext, red:UOp):
   inp, reduce_range = red.src[0], red.src[1:]
-  lst = horizontal_reduce(inp, red.dtype)
-  assert all(x.dtype == red.dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {red.dtype}"
+  # on CPU, defer horizontal reduction for type-promoting reductions (e.g. half->float) to preserve vectorization
+  defer = ctx.ren is not None and ctx.ren.device == "CPU" and _has_type_promotion(inp) and len(reduce_range) > 0
+  acc_dtype = inp.dtype if defer else red.dtype
+  lst = [inp] if defer else horizontal_reduce(inp, red.dtype)
+  assert all(x.dtype == acc_dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {acc_dtype}"
   # if we have a range
   if len(reduce_range) != 0:
     topo = inp.toposort()
     ended_ranges = flatten([x.ended_ranges for x in topo if x.op is Ops.END])
     input_ranges = tuple([x for x in topo if x.op is Ops.RANGE and x not in reduce_range and x not in ended_ranges])
-    identity = red.const(red.dtype, identity_element(red.arg, red.dtype.scalar()))
-    acc = UOp(Ops.DEFINE_REG, red.dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
+    identity = red.const(acc_dtype, identity_element(red.arg, red.dtype.scalar()))
+    acc = UOp(Ops.DEFINE_REG, acc_dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
+    if defer: acc = acc.rtag("deferred")
     acc_init = acc.after(*input_ranges).index(UOp.const(dtypes.int, 0)).store(identity)
     lst = [acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0))] + lst  # put acc as the first element
     ctx.acc_num += 1
@@ -328,7 +347,11 @@ def reduce_to_acc(ctx:ReduceContext, red:UOp):
   if len(reduce_range) == 0: return ret
   end = acc.index(UOp.const(dtypes.int, 0)).store(ret).end(*reduce_range)
   ctx.range_to_ends.setdefault(reduce_range, []).append(end)
-  return acc.after(end).index(UOp.const(dtypes.int, 0))
+  result = acc.after(end).index(UOp.const(dtypes.int, 0))
+  if defer:
+    hlst = horizontal_reduce(result, red.dtype)
+    return functools.reduce(lambda x,y: x.alu(red.arg, y), hlst)
+  return result
 
 def merge_reduce_ends(ctx:ReduceContext, sink:UOp):
   # merge ENDs that share the same range
