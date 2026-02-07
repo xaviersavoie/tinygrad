@@ -67,7 +67,7 @@ testing_minimal = [
   "pytest-timeout",
   "pytest-split",
   "hypothesis>=6.148.9",
-  "z3-solver",
+  "z3-solver==4.15.4.0",
 ]
 testing_unit = ["tinygrad[testing_minimal]", "tqdm", "safetensors", "tabulate", "openai", "ggml-python"]
 testing = [
