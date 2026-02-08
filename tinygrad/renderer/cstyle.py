@@ -260,6 +260,10 @@ class ClangRenderer(CStyleLanguage):
     (UPat(Ops.CAST, dtypes.floats, src=(UPat(GroupOp.ALU, dtypes.floats, name="alu"),), name="c"),
      lambda c, alu: UOp(alu.op, c.dtype, tuple(s.cast(c.dtype) if dtypes.is_float(s.dtype) else s for s in alu.src), alu.arg)
        if alu.dtype.scalar().itemsize < c.dtype.scalar().itemsize else None),
+    # hoist scalar CAST above GEP from vector: keeps CAST as vector op (single vcvtph2ps instead of N scalar fpext)
+    (UPat(Ops.CAST, name="c", src=(UPat(Ops.GEP, name="gep"),)),
+     lambda c, gep: gep.src[0].cast(c.dtype.vec(gep.src[0].dtype.vcount)).gep(gep.arg)
+       if len(gep.arg) == 1 and gep.src[0].dtype.vcount > 1 else None),
   ])
 
   if sys.platform == 'win32':
