@@ -5,7 +5,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.renderer.cstyle import AMDHIPRenderer, create_non_native_float_pats, pm_manual_bf16_cast
 from tinygrad.uop.decompositions import xexp2, xlog2
 from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, GroupOp, range_str
-from tinygrad.dtype import dtypes, float_to_fp8, DType, PtrDType, truncate
+from tinygrad.dtype import dtypes, float_to_fp8, DType, PtrDType, AddrSpace, truncate
 from tinygrad.helpers import prod, AMX, CPU_COUNT, getenv
 
 def ldt(dt:DType):
@@ -180,7 +180,7 @@ class LLVMRenderer(Renderer):
         r[u] = f"%{'local' if u.op is Ops.DEFINE_LOCAL else 'reg'}_{str(u.arg).replace('(', '').replace(')', '').replace(',', '_').replace(' ', '')}"
         assert isinstance(u.dtype, PtrDType)
         if u.op is Ops.DEFINE_REG:
-          kernel.append(f"  {r[u]} = alloca [{u.dtype.size} x {ldt(u.dtype.base)}]")
+          for i in range(u.dtype.size): kernel.append(f"  {r[u]}_{i} = alloca {ldt(u.dtype.base)}")
         elif self.has_local:
           local_args.append(f"@{r[u][1:]} = internal unnamed_addr addrspace(3) global [{u.dtype.size} x {ldt(u.dtype)}] undef, align 16")
           kernel.append(f"  {r[u]} = addrspacecast [{u.dtype.size} x {ldt(u.dtype)}] addrspace(3)* @{r[u][1:]} to [{u.dtype.size} x {ldt(u.dtype)}]*")
@@ -189,6 +189,8 @@ class LLVMRenderer(Renderer):
       elif u.op is Ops.CONST: r[u] = lconst(u.arg, u.dtype)
       elif u.op is Ops.CAST and (ldt(u.dtype) == ldt(u.src[0].dtype) or isinstance(u.dtype, PtrDType)):
         r[u] = r[u.src[0]] # cast from signed to unsigned of the same size is a noop, or pointer cast
+      elif u.op is Ops.INDEX and isinstance(u.dtype, PtrDType) and u.dtype.addrspace is AddrSpace.REG and u.src[1].op is Ops.CONST:
+        r[u] = f"{r[u.src[0]]}_{u.src[1].arg}"  # register INDEX: map to individual alloca, no GEP
       else:
         # if it's an assign target, it's already preallocated
         if u not in r:
