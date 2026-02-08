@@ -108,8 +108,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   is_dsp = k.ren is not None and k.ren.device == "DSP"
   is_cpu = k.ren is not None and k.ren.device == "CPU"
   cpu_simd = getattr(k.ren, 'simd_width', 8) if is_cpu else 0
+  cpu_reduce = is_cpu and k.reduceop is not None
   upcasted_axis: set[int] = set()
-  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= (16 if is_cpu else 1024)) and \
+  while not cpu_reduce and resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= (16 if is_cpu else 1024)) and \
         (k.upcast_size() < (cpu_simd if is_cpu else 32)):
     xb_choices = []
     upc = ([128] if not len(upcasted_axis) else []) if is_dsp else ([cpu_simd, 8, 4] if is_cpu else [3, 4])
@@ -148,16 +149,17 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
           k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
       else:
-        for splits in [4]:
+        for splits in ([cpu_simd, 4] if is_cpu else [4]):
           if k.full_shape[axis:=k.unrollable_dims[-1]]%splits == 0:
             k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, splits))
             break
   except KernelOptError: pass
 
   # if nothing at all is upcasted and it's easy to, do an upcast
-  for splits in [4]:
-    if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
-      k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
+  if not cpu_reduce:
+    for splits in [4]:
+      if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
+        k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
 
   # **** local groups ****
 
