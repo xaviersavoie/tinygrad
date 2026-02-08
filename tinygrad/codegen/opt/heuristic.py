@@ -109,7 +109,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   is_cpu = k.ren is not None and k.ren.device == "CPU"
   cpu_simd = getattr(k.ren, 'simd_width', 8) if is_cpu else 0
   upcasted_axis: set[int] = set()
-  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= (16 if is_cpu else 1024)) and \
+  # for CPU reduction kernels, skip output upcast — reduce unroll fills SIMD width instead
+  # this prevents SLP from vectorizing across output rows (which requires expensive weight transpose/shuffles)
+  while not (is_cpu and k.reduceop is not None) and \
+        resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= (16 if is_cpu else 1024)) and \
         (k.upcast_size() < (cpu_simd if is_cpu else 32)):
     xb_choices = []
     upc = ([128] if not len(upcasted_axis) else []) if is_dsp else ([cpu_simd, 8, 4] if is_cpu else [3, 4])
