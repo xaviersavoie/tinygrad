@@ -140,14 +140,14 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # if last reduce dim is small(ish), loop unroll the reduce
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
-    if k.unrollable_dims and (k.upcast_size() <= 4 or (not k.axes_of(AxisType.UNROLL) and not is_cpu)) and (k.upcast_size() < 64):
+    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
         # if it's small, upcast a second reduce dimension too
         if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
           k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
       else:
-        for splits in ([16, 8, 4] if is_cpu else [4]):
+        for splits in [4]:
           if k.full_shape[axis:=k.unrollable_dims[-1]]%splits == 0:
             k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, splits))
             break
