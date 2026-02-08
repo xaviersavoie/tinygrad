@@ -298,6 +298,11 @@ class ClangJITRenderer(ClangRenderer):
   def __init__(self):
     from tinygrad.runtime.support.compiler_cpu import ClangJITCompiler
     self.compiler = ClangJITCompiler()
+    try:
+      import ctypes
+      from tinygrad.runtime.autogen import llvm
+      self.simd_width = 16 if b'+avx512f' in ctypes.string_at(llvm.LLVMGetHostCPUFeatures()) else 8
+    except Exception: self.simd_width = 8
 
 class OpenCLRenderer(CStyleLanguage):
   device = "CL"

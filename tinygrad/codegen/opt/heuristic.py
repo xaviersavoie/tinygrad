@@ -107,11 +107,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # potentially do more upcasts of non reduce axes based on a heuristic
   is_dsp = k.ren is not None and k.ren.device == "DSP"
   is_cpu = k.ren is not None and k.ren.device == "CPU"
+  cpu_simd = getattr(k.ren, 'simd_width', 8) if is_cpu else 0
   upcasted_axis: set[int] = set()
   while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= (16 if is_cpu else 1024)) and \
-        (k.upcast_size() < (8 if is_cpu else 32)):
+        (k.upcast_size() < (cpu_simd if is_cpu else 32)):
     xb_choices = []
-    upc = ([128] if not len(upcasted_axis) else []) if is_dsp else ([8, 4] if is_cpu else [3, 4])
+    upc = ([128] if not len(upcasted_axis) else []) if is_dsp else ([cpu_simd, 8, 4] if is_cpu else [3, 4])
     for axis, upcast_amount in itertools.product(k.upcastable_dims, upc):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue

@@ -210,6 +210,10 @@ class CPULLVMRenderer(LLVMRenderer):
   global_max = (CPU_COUNT.value, 0, 0)
   abi = 'win64cc' if sys.platform == 'win32' else None
   string_rewrite = base_rewrite + PatternMatcher([(UPat(Ops.WMMA, name="wmma"), render_wmma_amx)])
+  def __init__(self):
+    import ctypes
+    from tinygrad.runtime.autogen import llvm
+    self.simd_width = 16 if b'+avx512f' in ctypes.string_at(llvm.LLVMGetHostCPUFeatures()) else 8
   def render(self, uops: list[UOp]) -> str: return "\n".join((k:=self._render_kernel(uops))[0] + (k[1], self._render_footer(uops)))
   def _render_footer(self, uops: list[UOp]) -> str: return 'attributes #0 = { alwaysinline nounwind "no-builtins" "no-trapping-math"="true" }'
 
