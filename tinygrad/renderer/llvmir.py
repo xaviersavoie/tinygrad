@@ -139,7 +139,12 @@ class LLVMRenderer(Renderer):
   code_for_op = {Ops.FDIV: lambda: None, Ops.CMPLT: lambda: None}
   if AMX: tensor_cores = tc.amx
 
-  extra_matcher = create_non_native_float_pats((dtypes.bfloat16,)) + pm_manual_bf16_cast
+  extra_matcher = create_non_native_float_pats((dtypes.bfloat16,)) + pm_manual_bf16_cast + PatternMatcher([
+    # promote narrow float ALU when immediately cast to wider float (enables FMA on CPU)
+    (UPat(Ops.CAST, dtypes.floats, src=(UPat(GroupOp.ALU, dtypes.floats, name="alu"),), name="c"),
+     lambda c, alu: UOp(alu.op, c.dtype, tuple(s.cast(c.dtype) if dtypes.is_float(s.dtype) else s for s in alu.src), alu.arg)
+       if alu.dtype.scalar().itemsize < c.dtype.scalar().itemsize else None),
+  ])
   def _render_fn(self, name:str, args:list[tuple[str,DType]], kernel:list[str], prefix:list[str]|None=None) -> str:
     # NOTE: CPUAllocator promises 0x20 alignment
     sargs = ", ".join([f"{ldt(dt)}{' noalias align 32' if isinstance(dt, PtrDType) else ''} {name}" for name,dt in args])
