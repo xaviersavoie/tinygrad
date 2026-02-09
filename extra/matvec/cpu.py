@@ -5,7 +5,7 @@ from tinygrad.renderer import Estimates
 from tinygrad.runtime.support.compiler_cpu import ClangJITCompiler
 
 # ** C source generation — row formulation for (M, K) weight layout
-# y[m] = sum_k W[m,k] * x[k], vectorized over K, unrolled M by 4
+# y[m] = sum_k W[m,k] * x[k], vectorized over K, unrolled M by 8
 
 def _src_x86(name: str, M: int, K: int, half: bool) -> str:
   wtype = "__fp16" if half else "float"
@@ -19,18 +19,24 @@ static inline float hsum256(__m256 v) {{
   return _mm_cvtss_f32(_mm_add_ss(lo, _mm_movehl_ps(lo, lo)));
 }}
 void {name}(float* restrict data0, {wtype}* restrict data1, float* restrict data2) {{
-  for (int m = 0; m < {M}; m += 4) {{
-    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-    __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+  for (int m = 0; m < {M}; m += 8) {{
+    __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps(), a2=_mm256_setzero_ps(), a3=_mm256_setzero_ps();
+    __m256 a4=_mm256_setzero_ps(), a5=_mm256_setzero_ps(), a6=_mm256_setzero_ps(), a7=_mm256_setzero_ps();
     for (int k = 0; k < {K}; k += 8) {{
       __m256 xv = _mm256_loadu_ps(data2 + k);
       a0 = _mm256_fmadd_ps({load_w(f"(m+0)*{K} + k")}, xv, a0);
       a1 = _mm256_fmadd_ps({load_w(f"(m+1)*{K} + k")}, xv, a1);
       a2 = _mm256_fmadd_ps({load_w(f"(m+2)*{K} + k")}, xv, a2);
       a3 = _mm256_fmadd_ps({load_w(f"(m+3)*{K} + k")}, xv, a3);
+      a4 = _mm256_fmadd_ps({load_w(f"(m+4)*{K} + k")}, xv, a4);
+      a5 = _mm256_fmadd_ps({load_w(f"(m+5)*{K} + k")}, xv, a5);
+      a6 = _mm256_fmadd_ps({load_w(f"(m+6)*{K} + k")}, xv, a6);
+      a7 = _mm256_fmadd_ps({load_w(f"(m+7)*{K} + k")}, xv, a7);
     }}
     data0[m+0] = hsum256(a0); data0[m+1] = hsum256(a1);
     data0[m+2] = hsum256(a2); data0[m+3] = hsum256(a3);
+    data0[m+4] = hsum256(a4); data0[m+5] = hsum256(a5);
+    data0[m+6] = hsum256(a6); data0[m+7] = hsum256(a7);
   }}
 }}
 """
@@ -41,18 +47,24 @@ def _src_arm(name: str, M: int, K: int, half: bool) -> str:
   return f"""\
 #include <arm_neon.h>
 void {name}(float* restrict data0, {wtype}* restrict data1, float* restrict data2) {{
-  for (int m = 0; m < {M}; m += 4) {{
-    float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
-    float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+  for (int m = 0; m < {M}; m += 8) {{
+    float32x4_t a0=vdupq_n_f32(0), a1=vdupq_n_f32(0), a2=vdupq_n_f32(0), a3=vdupq_n_f32(0);
+    float32x4_t a4=vdupq_n_f32(0), a5=vdupq_n_f32(0), a6=vdupq_n_f32(0), a7=vdupq_n_f32(0);
     for (int k = 0; k < {K}; k += 4) {{
       float32x4_t xv = vld1q_f32(data2 + k);
       a0 = vfmaq_f32(a0, {load_w(f"(m+0)*{K} + k")}, xv);
       a1 = vfmaq_f32(a1, {load_w(f"(m+1)*{K} + k")}, xv);
       a2 = vfmaq_f32(a2, {load_w(f"(m+2)*{K} + k")}, xv);
       a3 = vfmaq_f32(a3, {load_w(f"(m+3)*{K} + k")}, xv);
+      a4 = vfmaq_f32(a4, {load_w(f"(m+4)*{K} + k")}, xv);
+      a5 = vfmaq_f32(a5, {load_w(f"(m+5)*{K} + k")}, xv);
+      a6 = vfmaq_f32(a6, {load_w(f"(m+6)*{K} + k")}, xv);
+      a7 = vfmaq_f32(a7, {load_w(f"(m+7)*{K} + k")}, xv);
     }}
     data0[m+0] = vaddvq_f32(a0); data0[m+1] = vaddvq_f32(a1);
     data0[m+2] = vaddvq_f32(a2); data0[m+3] = vaddvq_f32(a3);
+    data0[m+4] = vaddvq_f32(a4); data0[m+5] = vaddvq_f32(a5);
+    data0[m+6] = vaddvq_f32(a6); data0[m+7] = vaddvq_f32(a7);
   }}
 }}
 """
@@ -91,7 +103,7 @@ def can_use_cpu_matvec(a: Tensor, b: Tensor) -> bool:
   if arch not in _src_fn: return False
   K, M = b.shape
   sk = _simd_k[arch]
-  if K % sk != 0 or M % 4 != 0: return False
+  if K % sk != 0 or M % 8 != 0: return False
   return True
 
 def cpu_matvec(a: Tensor, b: Tensor) -> Tensor:
