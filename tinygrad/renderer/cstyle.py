@@ -230,6 +230,17 @@ class ClangRenderer(CStyleLanguage):
   nan = '__builtin_nanf("")'
   if AMX: tensor_cores = tc.amx
 
+  # render DEFINE_REG as scalar variables instead of an array — keeps accumulators in registers
+  _reg = UPat((Ops.DEFINE_REG, Ops.AFTER))
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.DEFINE_REG, name="x"),
+     lambda ctx,x: " ".join(f"{ctx.render_dtype(x.dtype.base)} {ctx[x]}_{i};" for i in range(x.dtype.size))),
+    (UPat(Ops.INDEX, src=(_reg, UPat(Ops.CONST, name="idx")), name="x"), lambda ctx,x,idx: f"{ctx[x.src[0]]}_{idx.arg}"),
+    (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(_reg, UPat(Ops.CONST))),), name="x"), lambda ctx,x: ctx[x.src[0]]),
+    (UPat(Ops.STORE, src=(UPat(Ops.INDEX, src=(_reg, UPat(Ops.CONST))), UPat.var("var")), name="x"),
+     lambda ctx,x,var: f"{ctx[x.src[0]]} = {ctx[var]};"),
+  ]) + base_rewrite
+
   # language options
   buffer_suffix = " restrict"
   type_map = {dtypes.bool:"_Bool", dtypes.half:"__fp16"}
@@ -244,7 +255,16 @@ class ClangRenderer(CStyleLanguage):
                                  (UPat.var("x", dtypes.float64).cast(dtypes.bfloat16), lambda x: x.cast(dtypes.float32).cast(dtypes.bfloat16)),
                                  (UPat.var("x", dtypes.bfloat16).cast(dtypes.float16), lambda x: x.cast(dtypes.float32).cast(dtypes.float16)),
     (UPat((Ops.SQRT, Ops.TRUNC), name="alu"), no_vectorized_alu)]) + create_non_native_float_pats((dtypes.bfloat16,)) + pm_manual_bf16_cast + \
-    CStyleLanguage.extra_matcher
+    CStyleLanguage.extra_matcher + PatternMatcher([
+    # promote narrow float ALU when immediately cast to wider float (enables FMA on CPU)
+    (UPat(Ops.CAST, dtypes.floats, src=(UPat(GroupOp.ALU, dtypes.floats, name="alu"),), name="c"),
+     lambda c, alu: UOp(alu.op, c.dtype, tuple(s.cast(c.dtype) if dtypes.is_float(s.dtype) else s for s in alu.src), alu.arg)
+       if alu.dtype.scalar().itemsize < c.dtype.scalar().itemsize else None),
+    # hoist scalar CAST above GEP from vector: keeps CAST as vector op (single vcvtph2ps instead of N scalar fpext)
+    (UPat(Ops.CAST, name="c", src=(UPat(Ops.GEP, name="gep"),)),
+     lambda c, gep: gep.src[0].cast(c.dtype.vec(gep.src[0].dtype.vcount)).gep(gep.arg)
+       if len(gep.arg) == 1 and gep.src[0].dtype.vcount > 1 else None),
+  ])
 
   if sys.platform == 'win32':
     kernel_typedef = "__attribute__((ms_abi)) void"
@@ -282,6 +302,11 @@ class ClangJITRenderer(ClangRenderer):
   def __init__(self):
     from tinygrad.runtime.support.compiler_cpu import ClangJITCompiler
     self.compiler = ClangJITCompiler()
+    try:
+      import ctypes
+      from tinygrad.runtime.autogen import llvm
+      self.simd_width = 16 if b'+avx512f' in ctypes.string_at(llvm.LLVMGetHostCPUFeatures()) else 8
+    except Exception: self.simd_width = 8
 
 class OpenCLRenderer(CStyleLanguage):
   device = "CL"

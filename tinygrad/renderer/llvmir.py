@@ -5,7 +5,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.renderer.cstyle import AMDHIPRenderer, create_non_native_float_pats, pm_manual_bf16_cast
 from tinygrad.uop.decompositions import xexp2, xlog2
 from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, GroupOp, range_str
-from tinygrad.dtype import dtypes, float_to_fp8, DType, PtrDType, truncate
+from tinygrad.dtype import dtypes, float_to_fp8, DType, PtrDType, AddrSpace, truncate
 from tinygrad.helpers import prod, AMX, CPU_COUNT, getenv
 
 def ldt(dt:DType):
@@ -139,7 +139,16 @@ class LLVMRenderer(Renderer):
   code_for_op = {Ops.FDIV: lambda: None, Ops.CMPLT: lambda: None}
   if AMX: tensor_cores = tc.amx
 
-  extra_matcher = create_non_native_float_pats((dtypes.bfloat16,)) + pm_manual_bf16_cast
+  extra_matcher = create_non_native_float_pats((dtypes.bfloat16,)) + pm_manual_bf16_cast + PatternMatcher([
+    # promote narrow float ALU when immediately cast to wider float (enables FMA on CPU)
+    (UPat(Ops.CAST, dtypes.floats, src=(UPat(GroupOp.ALU, dtypes.floats, name="alu"),), name="c"),
+     lambda c, alu: UOp(alu.op, c.dtype, tuple(s.cast(c.dtype) if dtypes.is_float(s.dtype) else s for s in alu.src), alu.arg)
+       if alu.dtype.scalar().itemsize < c.dtype.scalar().itemsize else None),
+    # hoist scalar CAST above GEP from vector: keeps CAST as vector op (single vcvtph2ps instead of N scalar fpext)
+    (UPat(Ops.CAST, name="c", src=(UPat(Ops.GEP, name="gep"),)),
+     lambda c, gep: gep.src[0].cast(c.dtype.vec(gep.src[0].dtype.vcount)).gep(gep.arg)
+       if len(gep.arg) == 1 and gep.src[0].dtype.vcount > 1 else None),
+  ])
   def _render_fn(self, name:str, args:list[tuple[str,DType]], kernel:list[str], prefix:list[str]|None=None) -> str:
     # NOTE: CPUAllocator promises 0x20 alignment
     sargs = ", ".join([f"{ldt(dt)}{' noalias align 32' if isinstance(dt, PtrDType) else ''} {name}" for name,dt in args])
@@ -175,7 +184,7 @@ class LLVMRenderer(Renderer):
         r[u] = f"%{'local' if u.op is Ops.DEFINE_LOCAL else 'reg'}_{str(u.arg).replace('(', '').replace(')', '').replace(',', '_').replace(' ', '')}"
         assert isinstance(u.dtype, PtrDType)
         if u.op is Ops.DEFINE_REG:
-          kernel.append(f"  {r[u]} = alloca [{u.dtype.size} x {ldt(u.dtype.base)}]")
+          for i in range(u.dtype.size): kernel.append(f"  {r[u]}_{i} = alloca {ldt(u.dtype.base)}")
         elif self.has_local:
           local_args.append(f"@{r[u][1:]} = internal unnamed_addr addrspace(3) global [{u.dtype.size} x {ldt(u.dtype)}] undef, align 16")
           kernel.append(f"  {r[u]} = addrspacecast [{u.dtype.size} x {ldt(u.dtype)}] addrspace(3)* @{r[u][1:]} to [{u.dtype.size} x {ldt(u.dtype)}]*")
@@ -184,6 +193,8 @@ class LLVMRenderer(Renderer):
       elif u.op is Ops.CONST: r[u] = lconst(u.arg, u.dtype)
       elif u.op is Ops.CAST and (ldt(u.dtype) == ldt(u.src[0].dtype) or isinstance(u.dtype, PtrDType)):
         r[u] = r[u.src[0]] # cast from signed to unsigned of the same size is a noop, or pointer cast
+      elif u.op is Ops.INDEX and isinstance(u.dtype, PtrDType) and u.dtype.addrspace is AddrSpace.REG and u.src[1].op is Ops.CONST:
+        r[u] = f"{r[u.src[0]]}_{u.src[1].arg}"  # register INDEX: map to individual alloca, no GEP
       else:
         # if it's an assign target, it's already preallocated
         if u not in r:
@@ -203,6 +214,10 @@ class CPULLVMRenderer(LLVMRenderer):
   global_max = (CPU_COUNT.value, 0, 0)
   abi = 'win64cc' if sys.platform == 'win32' else None
   string_rewrite = base_rewrite + PatternMatcher([(UPat(Ops.WMMA, name="wmma"), render_wmma_amx)])
+  def __init__(self):
+    import ctypes
+    from tinygrad.runtime.autogen import llvm
+    self.simd_width = 16 if b'+avx512f' in ctypes.string_at(llvm.LLVMGetHostCPUFeatures()) else 8
   def render(self, uops: list[UOp]) -> str: return "\n".join((k:=self._render_kernel(uops))[0] + (k[1], self._render_footer(uops)))
   def _render_footer(self, uops: list[UOp]) -> str: return 'attributes #0 = { alwaysinline nounwind "no-builtins" "no-trapping-math"="true" }'
 

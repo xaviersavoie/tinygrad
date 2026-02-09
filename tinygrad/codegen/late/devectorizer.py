@@ -154,7 +154,7 @@ def split_load_store(ctx:Renderer|None, ls:UOp, idx:UOp):
     lengths = [4]
   elif ctx is not None and ctx.supports_float4:
     # TODO: a better way to get this than ctx
-    lengths = [8,4,2] if buf.dtype.base == dtypes.half and getenv("ALLOW_HALF8") else ([16,8,4,2] if AMX else [4,2])
+    lengths = [8,4,2] if buf.dtype.base == dtypes.half and getenv("ALLOW_HALF8") else ([16,8,4,2] if AMX else [8,4,2] if ctx.device == "CPU" else [4,2])
   lengths.append(1)  # worst case, it's not folded
 
   # filter fold lengths that don't divide
@@ -301,6 +301,7 @@ class ReduceContext:
   acc_num: int = 0
   # track ENDs by range for merging parallel reduces
   range_to_ends: dict[tuple[UOp, ...], list[UOp]] = field(default_factory=dict)
+  vec_reduce: bool = False
 
 def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
   # if this has a horizontal reduction component, do that first
@@ -312,15 +313,23 @@ def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
 
 def reduce_to_acc(ctx:ReduceContext, red:UOp):
   inp, reduce_range = red.src[0], red.src[1:]
-  lst = horizontal_reduce(inp, red.dtype)
-  assert all(x.dtype == red.dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {red.dtype}"
+  # for CPU vec reduce: keep vec accumulator inside loop, defer horizontal reduce to after
+  use_vec = ctx.vec_reduce and inp.dtype != red.dtype and red.dtype.count == 1 and len(reduce_range) > 0
+  if use_vec:
+    acc_dtype = inp.dtype
+    lst = [inp]
+  else:
+    acc_dtype = red.dtype
+    lst = horizontal_reduce(inp, red.dtype)
+    assert all(x.dtype == red.dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {red.dtype}"
   # if we have a range
   if len(reduce_range) != 0:
     topo = inp.toposort()
     ended_ranges = flatten([x.ended_ranges for x in topo if x.op is Ops.END])
     input_ranges = tuple([x for x in topo if x.op is Ops.RANGE and x not in reduce_range and x not in ended_ranges])
-    identity = red.const(red.dtype, identity_element(red.arg, red.dtype.scalar()))
-    acc = UOp(Ops.DEFINE_REG, red.dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
+    scalar_id = red.const(red.dtype, identity_element(red.arg, red.dtype.scalar()))
+    identity = UOp(Ops.VECTORIZE, acc_dtype, (scalar_id,) * acc_dtype.count) if use_vec else scalar_id
+    acc = UOp(Ops.DEFINE_REG, acc_dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
     acc_init = acc.after(*input_ranges).index(UOp.const(dtypes.int, 0)).store(identity)
     lst = [acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0))] + lst  # put acc as the first element
     ctx.acc_num += 1
@@ -328,7 +337,10 @@ def reduce_to_acc(ctx:ReduceContext, red:UOp):
   if len(reduce_range) == 0: return ret
   end = acc.index(UOp.const(dtypes.int, 0)).store(ret).end(*reduce_range)
   ctx.range_to_ends.setdefault(reduce_range, []).append(end)
-  return acc.after(end).index(UOp.const(dtypes.int, 0))
+  result = acc.after(end).index(UOp.const(dtypes.int, 0))
+  # after loop: horizontal reduce vec accumulator to scalar
+  if use_vec: return functools.reduce(lambda x,y: x.alu(red.arg, y), horizontal_reduce(result, red.dtype))
+  return result
 
 def merge_reduce_ends(ctx:ReduceContext, sink:UOp):
   # merge ENDs that share the same range
