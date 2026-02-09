@@ -11,110 +11,47 @@ def _has_avx512() -> bool:
   except Exception: return False
 _avx512 = _has_avx512()
 
-# ** C source generation — row formulation for (M, K) weight layout
-# y[m] = sum_k W[m,k] * x[k], vectorized over K, unrolled M by 8
+# ** C source generation — y[m] = sum_k W[m,k]*x[k], vectorized over K, M unrolled by 8
+# each arch: (include, vec_type, simd_width, zero, load_f32, load_f16, fma(w,x,acc), hsum, helper_code)
+_ARCHS = {
+  'avx512': ('immintrin.h', '__m512', 16, '_mm512_setzero_ps()',
+    lambda a: f'_mm512_loadu_ps({a})', lambda a: f'_mm512_cvtph_ps(_mm256_loadu_si256((__m256i*)({a})))',
+    lambda w,x,c: f'_mm512_fmadd_ps({w},{x},{c})', lambda v: f'_mm512_reduce_add_ps({v})', ''),
+  'avx2': ('immintrin.h', '__m256', 8, '_mm256_setzero_ps()',
+    lambda a: f'_mm256_loadu_ps({a})', lambda a: f'_mm256_cvtph_ps(_mm_loadu_si128((__m128i*)({a})))',
+    lambda w,x,c: f'_mm256_fmadd_ps({w},{x},{c})', lambda v: f'hsum256({v})',
+    'static inline float hsum256(__m256 v) {\n  __m128 hi = _mm256_extractf128_ps(v, 1);\n'
+    '  __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), hi);\n  lo = _mm_add_ps(lo, _mm_movehdup_ps(lo));\n'
+    '  return _mm_cvtss_f32(_mm_add_ss(lo, _mm_movehl_ps(lo, lo)));\n}\n'),
+  'neon': ('arm_neon.h', 'float32x4_t', 4, 'vdupq_n_f32(0)',
+    lambda a: f'vld1q_f32({a})', lambda a: f'vcvt_f32_f16(vld1_f16({a}))',
+    lambda w,x,c: f'vfmaq_f32({c},{w},{x})', lambda v: f'vaddvq_f32({v})', ''),
+}
 
-def _src_x86_avx512(name: str, M: int, K: int, half: bool) -> str:
-  wtype = "__fp16" if half else "float"
-  load_w = lambda off: f"_mm512_cvtph_ps(_mm256_loadu_si256((__m256i*)(data1 + {off})))" if half else f"_mm512_loadu_ps(data1 + {off})"
-  return f"""\
-#include <immintrin.h>
-void {name}(float* restrict data0, {wtype}* restrict data1, float* restrict data2) {{
-  for (int m = 0; m < {M}; m += 8) {{
-    __m512 a0=_mm512_setzero_ps(), a1=_mm512_setzero_ps(), a2=_mm512_setzero_ps(), a3=_mm512_setzero_ps();
-    __m512 a4=_mm512_setzero_ps(), a5=_mm512_setzero_ps(), a6=_mm512_setzero_ps(), a7=_mm512_setzero_ps();
-    for (int k = 0; k < {K}; k += 16) {{
-      __m512 xv = _mm512_loadu_ps(data2 + k);
-      a0 = _mm512_fmadd_ps({load_w(f"(m+0)*{K} + k")}, xv, a0);
-      a1 = _mm512_fmadd_ps({load_w(f"(m+1)*{K} + k")}, xv, a1);
-      a2 = _mm512_fmadd_ps({load_w(f"(m+2)*{K} + k")}, xv, a2);
-      a3 = _mm512_fmadd_ps({load_w(f"(m+3)*{K} + k")}, xv, a3);
-      a4 = _mm512_fmadd_ps({load_w(f"(m+4)*{K} + k")}, xv, a4);
-      a5 = _mm512_fmadd_ps({load_w(f"(m+5)*{K} + k")}, xv, a5);
-      a6 = _mm512_fmadd_ps({load_w(f"(m+6)*{K} + k")}, xv, a6);
-      a7 = _mm512_fmadd_ps({load_w(f"(m+7)*{K} + k")}, xv, a7);
-    }}
-    data0[m+0] = _mm512_reduce_add_ps(a0); data0[m+1] = _mm512_reduce_add_ps(a1);
-    data0[m+2] = _mm512_reduce_add_ps(a2); data0[m+3] = _mm512_reduce_add_ps(a3);
-    data0[m+4] = _mm512_reduce_add_ps(a4); data0[m+5] = _mm512_reduce_add_ps(a5);
-    data0[m+6] = _mm512_reduce_add_ps(a6); data0[m+7] = _mm512_reduce_add_ps(a7);
-  }}
-}}
-"""
-
-def _src_x86_avx2(name: str, M: int, K: int, half: bool) -> str:
-  wtype = "__fp16" if half else "float"
-  load_w = lambda off: f"_mm256_cvtph_ps(_mm_loadu_si128((__m128i*)(data1 + {off})))" if half else f"_mm256_loadu_ps(data1 + {off})"
-  return f"""\
-#include <immintrin.h>
-static inline float hsum256(__m256 v) {{
-  __m128 hi = _mm256_extractf128_ps(v, 1);
-  __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), hi);
-  lo = _mm_add_ps(lo, _mm_movehdup_ps(lo));
-  return _mm_cvtss_f32(_mm_add_ss(lo, _mm_movehl_ps(lo, lo)));
-}}
-void {name}(float* restrict data0, {wtype}* restrict data1, float* restrict data2) {{
-  for (int m = 0; m < {M}; m += 8) {{
-    __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps(), a2=_mm256_setzero_ps(), a3=_mm256_setzero_ps();
-    __m256 a4=_mm256_setzero_ps(), a5=_mm256_setzero_ps(), a6=_mm256_setzero_ps(), a7=_mm256_setzero_ps();
-    for (int k = 0; k < {K}; k += 8) {{
-      __m256 xv = _mm256_loadu_ps(data2 + k);
-      a0 = _mm256_fmadd_ps({load_w(f"(m+0)*{K} + k")}, xv, a0);
-      a1 = _mm256_fmadd_ps({load_w(f"(m+1)*{K} + k")}, xv, a1);
-      a2 = _mm256_fmadd_ps({load_w(f"(m+2)*{K} + k")}, xv, a2);
-      a3 = _mm256_fmadd_ps({load_w(f"(m+3)*{K} + k")}, xv, a3);
-      a4 = _mm256_fmadd_ps({load_w(f"(m+4)*{K} + k")}, xv, a4);
-      a5 = _mm256_fmadd_ps({load_w(f"(m+5)*{K} + k")}, xv, a5);
-      a6 = _mm256_fmadd_ps({load_w(f"(m+6)*{K} + k")}, xv, a6);
-      a7 = _mm256_fmadd_ps({load_w(f"(m+7)*{K} + k")}, xv, a7);
-    }}
-    data0[m+0] = hsum256(a0); data0[m+1] = hsum256(a1);
-    data0[m+2] = hsum256(a2); data0[m+3] = hsum256(a3);
-    data0[m+4] = hsum256(a4); data0[m+5] = hsum256(a5);
-    data0[m+6] = hsum256(a6); data0[m+7] = hsum256(a7);
-  }}
-}}
-"""
-
-def _src_arm(name: str, M: int, K: int, half: bool) -> str:
-  wtype = "__fp16" if half else "float"
-  load_w = lambda off: f"vcvt_f32_f16(vld1_f16(data1 + {off}))" if half else f"vld1q_f32(data1 + {off})"
-  return f"""\
-#include <arm_neon.h>
-void {name}(float* restrict data0, {wtype}* restrict data1, float* restrict data2) {{
-  for (int m = 0; m < {M}; m += 8) {{
-    float32x4_t a0=vdupq_n_f32(0), a1=vdupq_n_f32(0), a2=vdupq_n_f32(0), a3=vdupq_n_f32(0);
-    float32x4_t a4=vdupq_n_f32(0), a5=vdupq_n_f32(0), a6=vdupq_n_f32(0), a7=vdupq_n_f32(0);
-    for (int k = 0; k < {K}; k += 4) {{
-      float32x4_t xv = vld1q_f32(data2 + k);
-      a0 = vfmaq_f32(a0, {load_w(f"(m+0)*{K} + k")}, xv);
-      a1 = vfmaq_f32(a1, {load_w(f"(m+1)*{K} + k")}, xv);
-      a2 = vfmaq_f32(a2, {load_w(f"(m+2)*{K} + k")}, xv);
-      a3 = vfmaq_f32(a3, {load_w(f"(m+3)*{K} + k")}, xv);
-      a4 = vfmaq_f32(a4, {load_w(f"(m+4)*{K} + k")}, xv);
-      a5 = vfmaq_f32(a5, {load_w(f"(m+5)*{K} + k")}, xv);
-      a6 = vfmaq_f32(a6, {load_w(f"(m+6)*{K} + k")}, xv);
-      a7 = vfmaq_f32(a7, {load_w(f"(m+7)*{K} + k")}, xv);
-    }}
-    data0[m+0] = vaddvq_f32(a0); data0[m+1] = vaddvq_f32(a1);
-    data0[m+2] = vaddvq_f32(a2); data0[m+3] = vaddvq_f32(a3);
-    data0[m+4] = vaddvq_f32(a4); data0[m+5] = vaddvq_f32(a5);
-    data0[m+6] = vaddvq_f32(a6); data0[m+7] = vaddvq_f32(a7);
-  }}
-}}
-"""
-
-def _get_src_fn():
-  arch = platform.machine()
-  if arch in ('x86_64', 'AMD64'): return _src_x86_avx512 if _avx512 else _src_x86_avx2
-  if arch in ('arm64', 'aarch64'): return _src_arm
+def _get_arch():
+  m = platform.machine()
+  if m in ('x86_64', 'AMD64'): return 'avx512' if _avx512 else 'avx2'
+  if m in ('arm64', 'aarch64'): return 'neon'
   return None
 
-def _get_simd_k():
-  arch = platform.machine()
-  if arch in ('x86_64', 'AMD64'): return 16 if _avx512 else 8
-  if arch in ('arm64', 'aarch64'): return 4
-  return 0
+def _gen_src(name: str, M: int, K: int, half: bool) -> str:
+  inc, vec, w, zero, ld, ld16, fma, hsum, helper = _ARCHS[_get_arch()]
+  wtype, ldw = ("__fp16", ld16) if half else ("float", ld)
+  NL = '\n'
+  return f"""\
+#include <{inc}>
+{helper}void {name}(float* restrict data0, {wtype}* restrict data1, float* restrict data2) {{
+  for (int m = 0; m < {M}; m += 8) {{
+    {vec} {', '.join(f'a{i}={zero}' for i in range(4))};
+    {vec} {', '.join(f'a{i}={zero}' for i in range(4, 8))};
+    for (int k = 0; k < {K}; k += {w}) {{
+      {vec} xv = {ld('data2 + k')};
+{NL.join(f'      a{i} = {fma(ldw(f"data1 + (m+{i})*{K} + k"), "xv", f"a{i}")};' for i in range(8))}
+    }}
+{NL.join(f'    data0[m+{i}] = {hsum(f"a{i}")};' for i in range(8))}
+  }}
+}}
+"""
 
 # ** PROGRAM UOp builder
 
@@ -126,7 +63,7 @@ def _custom_cpu_matvec(C: UOp, A: UOp, B: UOp, dname: str) -> UOp:
   M, K = A.shape
   half = A.dtype.itemsize == 2
   name = f"matvec_{M}_{K}_{'f16' if half else 'f32'}"
-  src = _get_src_fn()(name, M, K, half)
+  src = _gen_src(name, M, K, half)
   if name not in _compile_cache: _compile_cache[name] = _compiler.compile_cached(src)
   binary = _compile_cache[name]
   wmem = M * K * (2 if half else 4)
@@ -143,10 +80,10 @@ def can_use_cpu_matvec(a: Tensor, b: Tensor) -> bool:
   if math.prod(a.shape[:-1]) != 1: return False
   if b.dtype not in {dtypes.half, dtypes.float16, dtypes.float, dtypes.float32}: return False
   if b.uop.op is not Ops.PERMUTE: return False
-  if _get_src_fn() is None: return False
+  arch = _get_arch()
+  if arch is None: return False
   K, M = b.shape
-  sk = _get_simd_k()
-  if K % sk != 0 or M % 8 != 0: return False
+  if K % _ARCHS[arch][2] != 0 or M % 8 != 0: return False
   return True
 
 def cpu_matvec(a: Tensor, b: Tensor) -> Tensor:
