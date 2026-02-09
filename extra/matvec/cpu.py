@@ -1,13 +1,48 @@
-import functools, math, platform
+import functools, math, platform, subprocess
 from tinygrad import Tensor, dtypes
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.renderer import Estimates
 from tinygrad.runtime.support.compiler_cpu import ClangJITCompiler
 
+# ** detect AVX-512 at import time (x86 only)
+def _has_avx512() -> bool:
+  if platform.machine() not in ('x86_64', 'AMD64'): return False
+  try: return b'avx512f' in subprocess.check_output(['grep', '-m1', 'flags', '/proc/cpuinfo'])
+  except Exception: return False
+_avx512 = _has_avx512()
+
 # ** C source generation — row formulation for (M, K) weight layout
 # y[m] = sum_k W[m,k] * x[k], vectorized over K, unrolled M by 8
 
-def _src_x86(name: str, M: int, K: int, half: bool) -> str:
+def _src_x86_avx512(name: str, M: int, K: int, half: bool) -> str:
+  wtype = "__fp16" if half else "float"
+  load_w = lambda off: f"_mm512_cvtph_ps(_mm256_loadu_si256((__m256i*)(data1 + {off})))" if half else f"_mm512_loadu_ps(data1 + {off})"
+  return f"""\
+#include <immintrin.h>
+void {name}(float* restrict data0, {wtype}* restrict data1, float* restrict data2) {{
+  for (int m = 0; m < {M}; m += 8) {{
+    __m512 a0=_mm512_setzero_ps(), a1=_mm512_setzero_ps(), a2=_mm512_setzero_ps(), a3=_mm512_setzero_ps();
+    __m512 a4=_mm512_setzero_ps(), a5=_mm512_setzero_ps(), a6=_mm512_setzero_ps(), a7=_mm512_setzero_ps();
+    for (int k = 0; k < {K}; k += 16) {{
+      __m512 xv = _mm512_loadu_ps(data2 + k);
+      a0 = _mm512_fmadd_ps({load_w(f"(m+0)*{K} + k")}, xv, a0);
+      a1 = _mm512_fmadd_ps({load_w(f"(m+1)*{K} + k")}, xv, a1);
+      a2 = _mm512_fmadd_ps({load_w(f"(m+2)*{K} + k")}, xv, a2);
+      a3 = _mm512_fmadd_ps({load_w(f"(m+3)*{K} + k")}, xv, a3);
+      a4 = _mm512_fmadd_ps({load_w(f"(m+4)*{K} + k")}, xv, a4);
+      a5 = _mm512_fmadd_ps({load_w(f"(m+5)*{K} + k")}, xv, a5);
+      a6 = _mm512_fmadd_ps({load_w(f"(m+6)*{K} + k")}, xv, a6);
+      a7 = _mm512_fmadd_ps({load_w(f"(m+7)*{K} + k")}, xv, a7);
+    }}
+    data0[m+0] = _mm512_reduce_add_ps(a0); data0[m+1] = _mm512_reduce_add_ps(a1);
+    data0[m+2] = _mm512_reduce_add_ps(a2); data0[m+3] = _mm512_reduce_add_ps(a3);
+    data0[m+4] = _mm512_reduce_add_ps(a4); data0[m+5] = _mm512_reduce_add_ps(a5);
+    data0[m+6] = _mm512_reduce_add_ps(a6); data0[m+7] = _mm512_reduce_add_ps(a7);
+  }}
+}}
+"""
+
+def _src_x86_avx2(name: str, M: int, K: int, half: bool) -> str:
   wtype = "__fp16" if half else "float"
   load_w = lambda off: f"_mm256_cvtph_ps(_mm_loadu_si128((__m128i*)(data1 + {off})))" if half else f"_mm256_loadu_ps(data1 + {off})"
   return f"""\
@@ -69,8 +104,17 @@ void {name}(float* restrict data0, {wtype}* restrict data1, float* restrict data
 }}
 """
 
-_src_fn = {'x86_64': _src_x86, 'AMD64': _src_x86, 'arm64': _src_arm, 'aarch64': _src_arm}
-_simd_k = {'x86_64': 8, 'AMD64': 8, 'arm64': 4, 'aarch64': 4}
+def _get_src_fn():
+  arch = platform.machine()
+  if arch in ('x86_64', 'AMD64'): return _src_x86_avx512 if _avx512 else _src_x86_avx2
+  if arch in ('arm64', 'aarch64'): return _src_arm
+  return None
+
+def _get_simd_k():
+  arch = platform.machine()
+  if arch in ('x86_64', 'AMD64'): return 16 if _avx512 else 8
+  if arch in ('arm64', 'aarch64'): return 4
+  return 0
 
 # ** PROGRAM UOp builder
 
@@ -82,7 +126,7 @@ def _custom_cpu_matvec(C: UOp, A: UOp, B: UOp, dname: str) -> UOp:
   M, K = A.shape
   half = A.dtype.itemsize == 2
   name = f"matvec_{M}_{K}_{'f16' if half else 'f32'}"
-  src = _src_fn[platform.machine()](name, M, K, half)
+  src = _get_src_fn()(name, M, K, half)
   if name not in _compile_cache: _compile_cache[name] = _compiler.compile_cached(src)
   binary = _compile_cache[name]
   wmem = M * K * (2 if half else 4)
@@ -98,18 +142,16 @@ def can_use_cpu_matvec(a: Tensor, b: Tensor) -> bool:
   if a.ndim < 2 or b.ndim != 2: return False
   if math.prod(a.shape[:-1]) != 1: return False
   if b.dtype not in {dtypes.half, dtypes.float16, dtypes.float, dtypes.float32}: return False
-  if b.uop.op is not Ops.PERMUTE: return False  # must be a transposed view of contiguous weight
-  arch = platform.machine()
-  if arch not in _src_fn: return False
+  if b.uop.op is not Ops.PERMUTE: return False
+  if _get_src_fn() is None: return False
   K, M = b.shape
-  sk = _simd_k[arch]
+  sk = _get_simd_k()
   if K % sk != 0 or M % 8 != 0: return False
   return True
 
 def cpu_matvec(a: Tensor, b: Tensor) -> Tensor:
   """a=(...,K) @ b=(K,M) where b is PERMUTE view of contiguous (M,K) weight."""
   K, M = b.shape
-  # extract the original contiguous (M,K) weight — same buffer, no copy
   w_orig = Tensor(b.uop.src[0], device=b.device)
   out = Tensor.empty(1, M, dtype=dtypes.float, device=a.device)
   out = Tensor.custom_kernel(out, w_orig, a.reshape(K), fxn=functools.partial(_custom_cpu_matvec, dname=a.device))[0]
