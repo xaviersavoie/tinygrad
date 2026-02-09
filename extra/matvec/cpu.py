@@ -1,0 +1,104 @@
+import functools, math, platform
+from tinygrad import Tensor, dtypes
+from tinygrad.uop.ops import UOp, Ops, KernelInfo
+from tinygrad.renderer import Estimates
+from tinygrad.runtime.support.compiler_cpu import ClangJITCompiler
+
+# ** C source generation — row formulation for (M, K) weight layout
+# y[m] = sum_k W[m,k] * x[k], vectorized over K, unrolled M by 4
+
+def _src_x86(name: str, M: int, K: int, half: bool) -> str:
+  wtype = "__fp16" if half else "float"
+  load_w = lambda off: f"_mm256_cvtph_ps(_mm_loadu_si128((__m128i*)(data1 + {off})))" if half else f"_mm256_loadu_ps(data1 + {off})"
+  return f"""\
+#include <immintrin.h>
+static inline float hsum256(__m256 v) {{
+  __m128 hi = _mm256_extractf128_ps(v, 1);
+  __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), hi);
+  lo = _mm_add_ps(lo, _mm_movehdup_ps(lo));
+  return _mm_cvtss_f32(_mm_add_ss(lo, _mm_movehl_ps(lo, lo)));
+}}
+void {name}(float* restrict data0, {wtype}* restrict data1, float* restrict data2) {{
+  for (int m = 0; m < {M}; m += 4) {{
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    for (int k = 0; k < {K}; k += 8) {{
+      __m256 xv = _mm256_loadu_ps(data2 + k);
+      a0 = _mm256_fmadd_ps({load_w(f"(m+0)*{K} + k")}, xv, a0);
+      a1 = _mm256_fmadd_ps({load_w(f"(m+1)*{K} + k")}, xv, a1);
+      a2 = _mm256_fmadd_ps({load_w(f"(m+2)*{K} + k")}, xv, a2);
+      a3 = _mm256_fmadd_ps({load_w(f"(m+3)*{K} + k")}, xv, a3);
+    }}
+    data0[m+0] = hsum256(a0); data0[m+1] = hsum256(a1);
+    data0[m+2] = hsum256(a2); data0[m+3] = hsum256(a3);
+  }}
+}}
+"""
+
+def _src_arm(name: str, M: int, K: int, half: bool) -> str:
+  wtype = "__fp16" if half else "float"
+  load_w = lambda off: f"vcvt_f32_f16(vld1_f16(data1 + {off}))" if half else f"vld1q_f32(data1 + {off})"
+  return f"""\
+#include <arm_neon.h>
+void {name}(float* restrict data0, {wtype}* restrict data1, float* restrict data2) {{
+  for (int m = 0; m < {M}; m += 4) {{
+    float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+    float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+    for (int k = 0; k < {K}; k += 4) {{
+      float32x4_t xv = vld1q_f32(data2 + k);
+      a0 = vfmaq_f32(a0, {load_w(f"(m+0)*{K} + k")}, xv);
+      a1 = vfmaq_f32(a1, {load_w(f"(m+1)*{K} + k")}, xv);
+      a2 = vfmaq_f32(a2, {load_w(f"(m+2)*{K} + k")}, xv);
+      a3 = vfmaq_f32(a3, {load_w(f"(m+3)*{K} + k")}, xv);
+    }}
+    data0[m+0] = vaddvq_f32(a0); data0[m+1] = vaddvq_f32(a1);
+    data0[m+2] = vaddvq_f32(a2); data0[m+3] = vaddvq_f32(a3);
+  }}
+}}
+"""
+
+_src_fn = {'x86_64': _src_x86, 'AMD64': _src_x86, 'arm64': _src_arm, 'aarch64': _src_arm}
+_simd_k = {'x86_64': 8, 'AMD64': 8, 'arm64': 4, 'aarch64': 4}
+
+# ** PROGRAM UOp builder
+
+_compile_cache: dict[str, bytes] = {}
+_compiler = ClangJITCompiler()
+
+def _custom_cpu_matvec(C: UOp, A: UOp, B: UOp, dname: str) -> UOp:
+  """Build PROGRAM UOp. C=out(1,M) float, A=W(M,K) contiguous, B=x(K,) float."""
+  M, K = A.shape
+  half = A.dtype.itemsize == 2
+  name = f"matvec_{M}_{K}_{'f16' if half else 'f32'}"
+  src = _src_fn[platform.machine()](name, M, K, half)
+  if name not in _compile_cache: _compile_cache[name] = _compiler.compile_cached(src)
+  binary = _compile_cache[name]
+  wmem = M * K * (2 if half else 4)
+  sink = UOp.sink(C.base, A.base, B.base, arg=KernelInfo(name=name, estimates=Estimates(ops=2*M*K, mem=wmem + K*4 + M*4)))
+  return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.DEVICE, arg=dname), UOp(Ops.LINEAR, src=(*sink.src, sink)),
+                                UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=binary)))
+
+# ** user-facing API
+
+def can_use_cpu_matvec(a: Tensor, b: Tensor) -> bool:
+  """Called from dot(self=a, w=b). b is weight.T (K,M) PERMUTE view of contiguous (M,K) weight."""
+  if a.device != "CPU" or b.device != "CPU": return False
+  if a.ndim < 2 or b.ndim != 2: return False
+  if math.prod(a.shape[:-1]) != 1: return False
+  if b.dtype not in {dtypes.half, dtypes.float16, dtypes.float, dtypes.float32}: return False
+  if b.uop.op is not Ops.PERMUTE: return False  # must be a transposed view of contiguous weight
+  arch = platform.machine()
+  if arch not in _src_fn: return False
+  K, M = b.shape
+  sk = _simd_k[arch]
+  if K % sk != 0 or M % 4 != 0: return False
+  return True
+
+def cpu_matvec(a: Tensor, b: Tensor) -> Tensor:
+  """a=(...,K) @ b=(K,M) where b is PERMUTE view of contiguous (M,K) weight."""
+  K, M = b.shape
+  # extract the original contiguous (M,K) weight — same buffer, no copy
+  w_orig = Tensor(b.uop.src[0], device=b.device)
+  out = Tensor.empty(1, M, dtype=dtypes.float, device=a.device)
+  out = Tensor.custom_kernel(out, w_orig, a.reshape(K), fxn=functools.partial(_custom_cpu_matvec, dname=a.device))[0]
+  return out.reshape(*a.shape[:-1], M)
