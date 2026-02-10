@@ -106,11 +106,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # potentially do more upcasts of non reduce axes based on a heuristic
   is_dsp = k.ren is not None and k.ren.device == "DSP"
+  is_cpu = k.ren is not None and k.ren.device == "CPU"
   upcasted_axis: set[int] = set()
-  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
+  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < (8 if is_cpu else 32)):
     xb_choices = []
     # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
-    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
+    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else ([8] if is_cpu else [3,4])):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
       rng = k.rngs[axis]
@@ -141,7 +142,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         # if it's small, upcast a second reduce dimension too
         if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
           k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
-      else:
+      elif not is_cpu:
         for splits in [4]:
           if k.full_shape[axis:=k.unrollable_dims[-1]]%splits == 0:
             k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, splits))
