@@ -27,7 +27,10 @@ jobs:
       with:
         key: llvm-speed
         deps: testing_unit
+        pydeps: torch transformers
         llvm: 'true'
+    - name: LLaMA CPU Test
+      run: CPU=1 CPU_LLVM=1 python3 test/speed/external_test_llama_cpu.py
     - name: Speed Test
       run: CPU=1 CPU_LLVM=1 THREADS=0 python3 test/speed/external_test_speed_v_torch.py
     - name: Speed Test (BEAM=2)
