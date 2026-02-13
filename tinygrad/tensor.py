@@ -2437,14 +2437,16 @@ class Tensor(OpMixin):
     x, dx, dw = self, self.ndim, w.ndim
     if not (dx > 0 and dw > 0): raise RuntimeError(f"both tensors need to be at least 1D, got {dx}D and {dw}D")
     if x.shape[-1] != w.shape[axis_w:=-min(w.ndim,2)]: raise RuntimeError(f"cannot dot {x.shape} and {w.shape}")
+    # on CPU matvec, ensure reduce axis is contiguous for LLVM loop vectorization
+    # check the original w before reshape+transpose: if it already has a permutation (e.g. nn.Linear's .T), reduce axis is already stride 1
+    _needs_contiguous = x.device == "CPU" and prod(self.shape[:-1]) <= 1 and dw >= 2
+    if _needs_contiguous:
+      u = w.uop
+      while u.op is Ops.RESHAPE: u = u.src[0]
+      _needs_contiguous = u.op is not Ops.PERMUTE
     x = x.reshape(*x.shape[0:-1], *[1]*min(dx-1, dw-1, 1), x.shape[-1])
     w = w.reshape(*w.shape[0:-2], *[1]*min(dx-1, dw-1, 1), *w.shape[axis_w:]).transpose(-1, axis_w)
-    if x.device == "CPU":
-      u, perm = w.uop, list(range(w.ndim))
-      while u.op in (Ops.PERMUTE, Ops.RESHAPE):
-        if u.op is Ops.PERMUTE: perm = [perm[i] for i in u.arg]
-        u = u.src[0]
-      if perm != list(range(w.ndim)): w = w.contiguous()
+    if _needs_contiguous: w = w.contiguous()
     return (x*w).sum(-1, dtype=dtype).cast(least_upper_dtype(x.dtype, w.dtype) if dtype is None else dtype)
 
   def matmul(self, x:Tensor, reverse=False, dtype:DTypeLike|None=None) -> Tensor:
