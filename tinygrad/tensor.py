@@ -2438,7 +2438,7 @@ class Tensor(OpMixin):
     if not (dx > 0 and dw > 0): raise RuntimeError(f"both tensors need to be at least 1D, got {dx}D and {dw}D")
     if x.shape[-1] != w.shape[axis_w:=-min(w.ndim,2)]: raise RuntimeError(f"cannot dot {x.shape} and {w.shape}")
     # CPU matvec: unwrap PERMUTE to use weight's natural contiguous layout for LLVM loop vectorization
-    if x.device == "CPU" and dw == 2 and resolve(prod(self.shape[:-1]) <= 1, False) and w.uop.op is Ops.PERMUTE:
+    if x.device == "CPU" and dw == 2 and resolve(prod(self.shape[:-1]) == 1, False) and w.uop.op is Ops.PERMUTE:
       raw_w = Tensor(w.uop.src[0], device=w.device)  # (M, K) with K as last axis (contiguous)
       M, K = raw_w.shape[0], self.shape[-1]
       return (raw_w * self.reshape(K)).sum(-1, dtype=dtype).reshape(*self.shape[:-1], M) \

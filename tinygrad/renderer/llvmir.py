@@ -67,7 +67,7 @@ unsigned_lop = { Ops.ADD: "add", Ops.MUL: "mul", Ops.IDIV: "udiv", Ops.MOD: "ure
                  Ops.CMPLT: "icmp ult", Ops.CMPNE: "icmp ne", Ops.CMPEQ: "icmp eq", Ops.OR: "or", Ops.AND: "and", Ops.XOR: "xor",
                  Ops.SHL: "shl", Ops.SHR: "lshr",}
 signed_lop = {**unsigned_lop, Ops.ADD: "add nsw", Ops.CMPLT: "icmp slt", Ops.IDIV: "sdiv", Ops.MOD: "srem", Ops.SHR: "ashr"}
-flags = " reassoc nsz arcp contract afn"
+flags = " nsz arcp contract afn"
 float_lop = {Ops.ADD: "fadd"+flags, Ops.MUL: "fmul"+flags, Ops.CMPLT: f"fcmp{flags} olt",
     Ops.CMPNE: f"fcmp{flags} une", Ops.CMPEQ: f"fcmp{flags} oeq", Ops.FDIV: "fdiv"+flags}
 lop = {**{x:unsigned_lop for x in (dtypes.bool,)+dtypes.uints}, **{x:signed_lop for x in dtypes.sints}, **{x:float_lop for x in dtypes.floats}}
@@ -203,7 +203,13 @@ class CPULLVMRenderer(LLVMRenderer):
   global_max = (CPU_COUNT.value, 0, 0)
   abi = 'win64cc' if sys.platform == 'win32' else None
   string_rewrite = base_rewrite + PatternMatcher([(UPat(Ops.WMMA, name="wmma"), render_wmma_amx)])
-  def render(self, uops: list[UOp]) -> str: return "\n".join((k:=self._render_kernel(uops))[0] + (k[1], self._render_footer(uops)))
+  def render(self, uops: list[UOp]) -> str:
+    result = "\n".join((k:=self._render_kernel(uops))[0] + (k[1], self._render_footer(uops)))
+    # add reassoc to fadd for large float reduction kernels (enables LLVM loop vectorizer vector accumulators)
+    if any(u.op is Ops.DEFINE_REG and u.dtype.base in dtypes.floats for u in uops) and \
+       any(u.op is Ops.RANGE and u.src[0].op is Ops.CONST and u.src[0].arg >= 256 for u in uops):
+      result = result.replace("fadd nsz", "fadd reassoc nsz")
+    return result
   def _render_footer(self, uops: list[UOp]) -> str: return 'attributes #0 = { alwaysinline nounwind "no-builtins" "no-trapping-math"="true" }'
 
 barrier = 'fence syncscope("workgroup") release\ntail call void @llvm.amdgcn.s.barrier()\nfence syncscope("workgroup") acquire\n'
