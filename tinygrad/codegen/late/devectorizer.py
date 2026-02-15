@@ -299,6 +299,7 @@ pm_render = PatternMatcher([
 @dataclass
 class ReduceContext:
   acc_num: int = 0
+  device: str = ""
   # track ENDs by range for merging parallel reduces
   range_to_ends: dict[tuple[UOp, ...], list[UOp]] = field(default_factory=dict)
 
@@ -320,6 +321,18 @@ def reduce_to_acc(ctx:ReduceContext, red:UOp):
     ended_ranges = flatten([x.ended_ranges for x in topo if x.op is Ops.END])
     input_ranges = tuple([x for x in topo if x.op is Ops.RANGE and x not in reduce_range and x not in ended_ranges])
     identity = red.const(red.dtype, identity_element(red.arg, red.dtype.scalar()))
+    # CPU: create independent accumulators for each horizontal element to break dependency chains
+    if ctx.device == "CPU" and len(lst) > 1:
+      ends, final_loads = [], []
+      for elem in lst:
+        acc = UOp(Ops.DEFINE_REG, red.dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
+        acc_init = acc.after(*input_ranges).index(UOp.const(dtypes.int, 0)).store(identity)
+        ret = acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0)).alu(red.arg, elem)
+        end = acc.index(UOp.const(dtypes.int, 0)).store(ret).end(*reduce_range)
+        ctx.range_to_ends.setdefault(reduce_range, []).append(end)
+        final_loads.append(acc.after(end).index(UOp.const(dtypes.int, 0)))
+        ctx.acc_num += 1
+      return functools.reduce(lambda x,y: x.alu(red.arg, y), final_loads)
     acc = UOp(Ops.DEFINE_REG, red.dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
     acc_init = acc.after(*input_ranges).index(UOp.const(dtypes.int, 0)).store(identity)
     lst = [acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0))] + lst  # put acc as the first element
