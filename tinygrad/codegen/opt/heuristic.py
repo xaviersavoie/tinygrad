@@ -105,9 +105,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   for axis in to_upcast[::-1]: k.apply_opt(Opt(OptOps.UPCAST, axis, 0))
 
   # potentially do more upcasts of non reduce axes based on a heuristic
+  is_cpu = k.ren is not None and k.ren.device == "CPU"
   is_dsp = k.ren is not None and k.ren.device == "DSP"
   upcasted_axis: set[int] = set()
-  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
+  while not is_cpu and resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
     # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
     for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
@@ -149,9 +150,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   except KernelOptError: pass
 
   # if nothing at all is upcasted and it's easy to, do an upcast
-  for splits in [4]:
-    if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
-      k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
+  if not is_cpu:
+    for splits in [4]:
+      if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
+        k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
 
   # **** local groups ****
 
