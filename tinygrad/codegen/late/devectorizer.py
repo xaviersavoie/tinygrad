@@ -344,8 +344,12 @@ def reduce_to_acc(ctx:ReduceContext, red:UOp):
   return acc.after(end).index(UOp.const(dtypes.int, 0))
 
 def merge_reduce_ends(ctx:ReduceContext, sink:UOp):
-  # merge ENDs that share the same range
-  subs = {e: UOp.group(*(e.src[0] for e in ends)).end(*r) for r, ends in ctx.range_to_ends.items() if len(ends) > 1 for e in ends}
+  # merge ENDs that share the same range (scan the graph for current ENDs, since references in ctx may be stale after rewrites)
+  if not any(len(v) > 1 for v in ctx.range_to_ends.values()): return None
+  ends_by_range: dict[tuple[UOp, ...], list[UOp]] = {}
+  for u in sink.toposort():
+    if u.op is Ops.END: ends_by_range.setdefault(u.src[1:], []).append(u)
+  subs = {e: UOp.group(*(e.src[0] for e in ends)).end(*r) for r, ends in ends_by_range.items() if len(ends) > 1 for e in ends}
   return sink.substitute(subs) if subs else None
 
 pm_reduce = PatternMatcher([
