@@ -227,13 +227,15 @@ def no_vectorized_wmma(wmma:UOp):
   wmma_ex = flatten([[e.gep(i) for i in range(out_sz)] for e in wmmas])
   return UOp(Ops.VECTORIZE, wmma.dtype, tuple(wmma_ex))
 
-def no_vectorized_alu(alu:UOp):
+def no_vectorized_alu(ctx, alu:UOp):
   if alu.dtype.vcount == 1: return None
   if alu.op is Ops.WHERE and alu.src[2].arg is Invalid: return None  # image load/store has cond.where(idx.vec(2), Invalid) as the index
+  if type(ctx).__name__ == "CPULLVMRenderer" and alu.dtype.scalar() == dtypes.float and alu.op in (Ops.ADD, Ops.MUL): return None
   alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg) for i in range(alu.dtype.vcount))
   return UOp(Ops.VECTORIZE, alu.dtype, alus)
 
-def no_vectorized_buf(buf:UOp):
+def no_vectorized_buf(ctx, buf:UOp):
+  if type(ctx).__name__ == "CPULLVMRenderer" and buf.op is Ops.DEFINE_REG and buf.ptrdtype.base.scalar() == dtypes.float: return None
   return buf.replace(dtype=buf.ptrdtype.base.scalar().ptr(buf.ptrdtype.size*buf.ptrdtype.count, buf.ptrdtype.addrspace)).cast(buf.dtype)
 
 def no_vectorized_index(buf:UOp, cast:UOp, idx:UOp):
@@ -301,6 +303,7 @@ class ReduceContext:
   acc_num: int = 0
   # track ENDs by range for merging parallel reduces
   range_to_ends: dict[tuple[UOp, ...], list[UOp]] = field(default_factory=dict)
+  ren: Renderer|None = None
 
 def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
   # if this has a horizontal reduction component, do that first
@@ -312,15 +315,18 @@ def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
 
 def reduce_to_acc(ctx:ReduceContext, red:UOp):
   inp, reduce_range = red.src[0], red.src[1:]
-  lst = horizontal_reduce(inp, red.dtype)
-  assert all(x.dtype == red.dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {red.dtype}"
+  # on CPU, defer horizontal reduction to after the loop for better vectorization
+  defer = type(ctx.ren).__name__ == "CPULLVMRenderer" and inp.dtype != red.dtype and len(reduce_range) > 0
+  acc_dtype = inp.dtype if defer else red.dtype
+  lst = [inp] if defer else horizontal_reduce(inp, red.dtype)
+  assert all(x.dtype == acc_dtype for x in lst), f"horizontal reduction mismatch {lst[0].dtype} != {acc_dtype}"
   # if we have a range
   if len(reduce_range) != 0:
     topo = inp.toposort()
     ended_ranges = flatten([x.ended_ranges for x in topo if x.op is Ops.END])
     input_ranges = tuple([x for x in topo if x.op is Ops.RANGE and x not in reduce_range and x not in ended_ranges])
-    identity = red.const(red.dtype, identity_element(red.arg, red.dtype.scalar()))
-    acc = UOp(Ops.DEFINE_REG, red.dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
+    identity = red.const(acc_dtype, identity_element(red.arg, red.dtype.scalar()))
+    acc = UOp(Ops.DEFINE_REG, acc_dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=ctx.acc_num)
     acc_init = acc.after(*input_ranges).index(UOp.const(dtypes.int, 0)).store(identity)
     lst = [acc.after(acc_init, *reduce_range).index(UOp.const(dtypes.int, 0))] + lst  # put acc as the first element
     ctx.acc_num += 1
@@ -328,7 +334,11 @@ def reduce_to_acc(ctx:ReduceContext, red:UOp):
   if len(reduce_range) == 0: return ret
   end = acc.index(UOp.const(dtypes.int, 0)).store(ret).end(*reduce_range)
   ctx.range_to_ends.setdefault(reduce_range, []).append(end)
-  return acc.after(end).index(UOp.const(dtypes.int, 0))
+  result = acc.after(end).index(UOp.const(dtypes.int, 0))
+  if defer:
+    hlst = horizontal_reduce(result, red.dtype)
+    return functools.reduce(lambda x,y: x.alu(red.arg, y), hlst)
+  return result
 
 def merge_reduce_ends(ctx:ReduceContext, sink:UOp):
   # merge ENDs that share the same range
