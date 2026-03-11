@@ -93,6 +93,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # **** below this line need to be optional and benchmarked ****
 
+  # CPU matvec: skip upcast/unroll, let LLVM loop vectorizer handle it
+  if k.ren is not None and k.ren.device == "CPU" and k.reduceop is not None and len(k.axes_of(AxisType.REDUCE)) == 1 \
+    and len(k.axes_of(AxisType.LOOP)) == 1 and resolve(k.full_shape[k.axes_of(AxisType.REDUCE)[0]] >= 256, False):
+    if DEBUG >= 3: print(f"CPU MATVEC: no upcast, letting LLVM vectorize, full_shape={k.full_shape}")
+    return k
+
   # if there are small dims with lots of valid masks, upcast them (they might be from Tensor.stack)
   to_upcast: list[int] = []
   # upcast leading axes first (hack-ish for winograd; we actually want to upcast masked axes with low stride first)
